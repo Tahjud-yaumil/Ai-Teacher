@@ -85,34 +85,34 @@ function buildExcerpt(pageTexts, pageStart, pageEnd) {
     .slice(0, 3000);
 }
 
-async function loadPrivatePdf(book) {
-  const pathname = String(book.blob_path || '').trim();
-  const storeId = process.env.BLOB_STORE_ID;
-  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
-
-  if (!pathname) throw new Error(`blob_path kosong untuk ${book.file_name}.`);
-  if (!storeId) throw new Error('BLOB_STORE_ID belum tersedia di environment Vercel.');
-
-  let signed;
+function normalizePathnameFromUrl(value) {
+  if (!value) return '';
   try {
-    const delegation = await issueSignedToken({
-      pathname,
-      operations: ['get'],
-      validUntil: Date.now() + 10 * 60 * 1000,
-      ...(oidcToken ? { oidcToken } : {}),
-      storeId,
-    });
-
-    signed = await presignUrl(delegation, {
-      operation: 'get',
-      pathname,
-      access: 'private',
-      validUntil: Date.now() + 5 * 60 * 1000,
-      useCache: false,
-    });
-  } catch (error) {
-    throw new Error(`Gagal membuat signed URL untuk ${book.file_name}: ${error instanceof Error ? error.message : String(error)}`);
+    const url = new URL(value);
+    return decodeURIComponent(url.pathname).replace(/^\/+/, '');
+  } catch {
+    return '';
   }
+}
+
+async function fetchSignedPdf(pathname, storeId, oidcToken, fileName) {
+  if (!pathname) throw new Error(`pathname kosong untuk ${fileName}.`);
+
+  const delegation = await issueSignedToken({
+    pathname,
+    operations: ['get'],
+    validUntil: Date.now() + 10 * 60 * 1000,
+    ...(oidcToken ? { oidcToken } : {}),
+    storeId,
+  });
+
+  const signed = await presignUrl(delegation, {
+    operation: 'get',
+    pathname,
+    access: 'private',
+    validUntil: Date.now() + 5 * 60 * 1000,
+    useCache: false,
+  });
 
   const response = await fetch(signed.presignedUrl, {
     method: 'GET',
@@ -120,11 +120,51 @@ async function loadPrivatePdf(book) {
   });
 
   if (!response.ok) {
-    throw new Error(`Blob GET HTTP ${response.status} untuk ${book.file_name}.`);
+    throw new Error(`Blob GET HTTP ${response.status} para ${pathname}`);
   }
 
   const arrayBuffer = await response.arrayBuffer();
   return Buffer.from(arrayBuffer);
+}
+
+async function loadPrivatePdf(sql, book) {
+  const storeId = process.env.BLOB_STORE_ID;
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
+  if (!storeId) throw new Error('BLOB_STORE_ID belum tersedia di environment Vercel.');
+
+  const candidates = [];
+  const storedPath = String(book.blob_path || '').trim();
+  const urlPath = normalizePathnameFromUrl(book.blob_url);
+
+  if (storedPath) candidates.push({ source: 'blob_path', pathname: storedPath });
+  if (urlPath && urlPath !== storedPath) candidates.push({ source: 'blob_url_pathname', pathname: urlPath });
+
+  if (!candidates.length) {
+    throw new Error(`Tidak ada pathname Blob untuk ${book.file_name}.`);
+  }
+
+  const errors = [];
+  for (const candidate of candidates) {
+    try {
+      const buffer = await fetchSignedPdf(candidate.pathname, storeId, oidcToken, book.file_name);
+
+      // If the database contained a stale/non-canonical pathname but the stored
+      // blob URL contains the actual Vercel-generated pathname, repair metadata.
+      if (candidate.pathname !== storedPath) {
+        await sql`
+          UPDATE books
+          SET blob_path = ${candidate.pathname}, updated_at = NOW()
+          WHERE id = ${book.id}
+        `;
+      }
+
+      return { buffer, resolvedPath: candidate.pathname, source: candidate.source };
+    } catch (error) {
+      errors.push(`${candidate.source}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  throw new Error(`PDF tidak dapat diambil dari Private Blob: ${errors.join(' | ')}`);
 }
 
 async function readTask(sql, task) {
@@ -167,7 +207,7 @@ async function readTask(sql, task) {
   const previousEndPage = Number(progress?.halaman_akhir || 0);
   const startPage = previousEndPage > 0 ? previousEndPage + 1 : 1;
 
-  const buffer = await loadPrivatePdf(book);
+  const { buffer, resolvedPath, source } = await loadPrivatePdf(sql, book);
   if (buffer.length < 5) throw new Error(`PDF kosong: ${book.file_name}`);
   if (buffer.subarray(0, 5).toString() !== '%PDF-') throw new Error(`Objek Blob bukan PDF valid: ${book.file_name}`);
 
@@ -186,13 +226,18 @@ async function readTask(sql, task) {
 
   await sql`
     UPDATE tasks
-    SET status = 'book_ready', book_path = ${book.blob_path}, error_message = '', updated_at = NOW()
+    SET status = 'book_ready',
+        book_path = ${resolvedPath},
+        error_message = '',
+        updated_at = NOW()
     WHERE task_id = ${task.task_id}
   `;
 
   return {
     task_id: task.task_id,
     status: 'success',
+    blob_resolution: source,
+    blob_path: resolvedPath,
     sekolah: task.sekolah,
     mapel: task.mapel,
     kelas: klasse,
