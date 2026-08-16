@@ -10,7 +10,7 @@ export default function ContextExtractorPage() {
   async function run() {
     setLoading(true); setResult(null);
     try {
-      const r = await fetch(`/api/context-extractor?run=${Date.now()}`, {
+      const r = await fetch(`/api/context-extractor-engine?run=${Date.now()}`, {
         method: 'POST',
         cache: 'no-store',
         headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' },
@@ -29,7 +29,7 @@ export default function ContextExtractorPage() {
     <main style={{maxWidth:1100,margin:'40px auto',padding:'0 20px',fontFamily:'Arial,sans-serif'}}>
       <h1>YaumiTeach / Step 6C</h1>
       <p>Context Extractor — mengambil konteks materi dari halaman subbab sebenarnya, bukan dari Daftar Isi.</p>
-      <p style={{fontSize:13,color:'#666'}}>Pipeline: Context Extractor v3 — real material pages</p>
+      <p style={{fontSize:13,color:'#666'}}>Pipeline: Context Extractor engine — process runner tidak lagi berbenturan dengan Node process.</p>
       <div style={{display:'flex',gap:12,alignItems:'center',margin:'20px 0'}}>
         <input type="date" value={tanggal} onChange={e=>setTanggal(e.target.value)} style={{padding:10}} />
         <button onClick={run} disabled={loading} style={{padding:'10px 16px',cursor:'pointer'}}>{loading?'Memproses...':'Jalankan Context Extractor'}</button>
