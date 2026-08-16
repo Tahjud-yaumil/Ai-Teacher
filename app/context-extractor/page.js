@@ -10,16 +10,26 @@ export default function ContextExtractorPage() {
   async function run() {
     setLoading(true); setResult(null);
     try {
-      const r = await fetch('/api/context-extractor', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({tanggal}) });
-      setResult(await r.json());
-    } catch (e) { setResult({status:'error', reason:e?.message || 'Gagal memanggil API.'}); }
-    finally { setLoading(false); }
+      const r = await fetch(`/api/context-extractor?run=${Date.now()}`, {
+        method: 'POST',
+        cache: 'no-store',
+        headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' },
+        body: JSON.stringify({ tanggal }),
+      });
+      const data = await r.json();
+      setResult(data);
+    } catch (e) {
+      setResult({ status: 'error', reason: e?.message || 'Gagal memanggil API.' });
+    } finally {
+      setLoading(false);
+    }
   }
 
   return (
     <main style={{maxWidth:1100,margin:'40px auto',padding:'0 20px',fontFamily:'Arial,sans-serif'}}>
       <h1>YaumiTeach / Step 6C</h1>
-      <p>Context Extractor — mengambil konteks bersih dari subbab yang dipilih Book Reader.</p>
+      <p>Context Extractor — mengambil konteks materi dari halaman subbab sebenarnya, bukan dari Daftar Isi.</p>
+      <p style={{fontSize:13,color:'#666'}}>Pipeline: Context Extractor v3 — real material pages</p>
       <div style={{display:'flex',gap:12,alignItems:'center',margin:'20px 0'}}>
         <input type="date" value={tanggal} onChange={e=>setTanggal(e.target.value)} style={{padding:10}} />
         <button onClick={run} disabled={loading} style={{padding:'10px 16px',cursor:'pointer'}}>{loading?'Memproses...':'Jalankan Context Extractor'}</button>
