@@ -29,6 +29,10 @@ export async function POST(request) {
       }, 400);
     }
 
+    // Progress Manager is idempotent:
+    // - pending -> process and mark progress_ready
+    // - progress_ready with pertemuan_berikutnya already set -> return stored result
+    // This prevents a retry from advancing the same class twice.
     const tasks = taskId
       ? await sql`
           SELECT * FROM tasks
@@ -38,7 +42,7 @@ export async function POST(request) {
       : await sql`
           SELECT * FROM tasks
           WHERE tanggal = ${tanggal}
-            AND status = 'pending'
+            AND status IN ('pending', 'progress_ready')
           ORDER BY jam_mulai NULLS LAST, task_id
         `;
 
@@ -49,6 +53,7 @@ export async function POST(request) {
               (SELECT COUNT(*)::int FROM tasks) AS total_tasks,
               (SELECT COUNT(*)::int FROM tasks WHERE tanggal = ${tanggal}) AS matching_date_tasks,
               (SELECT COUNT(*)::int FROM tasks WHERE tanggal = ${tanggal} AND status = 'pending') AS pending_date_tasks,
+              (SELECT COUNT(*)::int FROM tasks WHERE tanggal = ${tanggal} AND status = 'progress_ready') AS progress_ready_date_tasks,
               (SELECT COUNT(*)::int FROM progress) AS progress_rows
           `
         : await sql`
@@ -56,6 +61,7 @@ export async function POST(request) {
               (SELECT COUNT(*)::int FROM tasks) AS total_tasks,
               0::int AS matching_date_tasks,
               0::int AS pending_date_tasks,
+              0::int AS progress_ready_date_tasks,
               (SELECT COUNT(*)::int FROM progress) AS progress_rows
           `;
 
@@ -65,13 +71,34 @@ export async function POST(request) {
         tanggal,
         tasks: [],
         diagnostics: diagnostics[0],
-        reason: 'Tidak ada task pending untuk tanggal tersebut. Jalankan Scheduler untuk tanggal yang sama terlebih dahulu.'
+        reason: 'Tidak ada task yang siap diproses untuk tanggal tersebut.'
       });
     }
 
     const results = [];
 
     for (const task of tasks) {
+      // A previously completed Progress Manager task can safely be retried.
+      if (
+        task.status === 'progress_ready' &&
+        task.pertemuan_berikutnya !== null
+      ) {
+        results.push({
+          task_id: task.task_id,
+          sekolah: task.sekolah,
+          mapel: task.mapel,
+          kelas: task.kelas,
+          pertemuan_berikutnya: Number(task.pertemuan_berikutnya),
+          progress_status: task.progress_status || 'existing',
+          status_progress: 'reused',
+          requires_book: Boolean(task.requires_book),
+          requires_kbc: Boolean(task.requires_kbc),
+          requires_lintas_disiplin: Boolean(task.requires_lintas_disiplin),
+          idempotent: true
+        });
+        continue;
+      }
+
       if (task.jenis_kegiatan === 'Tugas Tambahan' || task.mapel === 'Guru Piket') {
         await sql`
           UPDATE tasks
