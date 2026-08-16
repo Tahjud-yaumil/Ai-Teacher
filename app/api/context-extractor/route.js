@@ -17,7 +17,12 @@ function parseUnit(line){const m=clean(line).match(UNIT_RE);if(!m)return null;re
 function lines(text){return String(text||'').split('\n').map(clean).filter(Boolean);}
 function isNoise(line){const t=norm(line);return !t||/^\d{1,4}$/.test(t)||/^[ivxlcdm]+$/.test(t)||/(kata pengantar|daftar isi|daftar gambar|daftar tabel|prakata|isbn|hak cipta|kementerian pendidikan|kementerian agama)/.test(t);}
 
-function sqlClient(){const e=env();if(!e.DATABASE_URL)throw new Error('DATABASE_URL belum tersedia di environment Vercel.');return neon(e.DATABASE_URL);}
+function sqlClient(){
+  const e=env();
+  const url=e.DATABASE_URL || e.POSTGRES_PRISMA_URL || e.POSTGRES_URL || e.DATABASE_URL_UNPOOLED;
+  if(!url) throw new Error('DATABASE_URL/POSTGRES_URL belum tersedia di environment Vercel.');
+  return neon(url);
+}
 
 async function resolveBlob(sql,book,mapel,kelas){
   const e=env();
