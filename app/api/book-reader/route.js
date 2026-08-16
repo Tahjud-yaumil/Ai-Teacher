@@ -1,5 +1,5 @@
 import { neon } from '@neondatabase/serverless';
-import { issueSignedToken, presignUrl } from '@vercel/blob';
+import { issueSignedToken, list, presignUrl } from '@vercel/blob';
 import pdfParse from 'pdf-parse';
 
 export const runtime = 'nodejs';
@@ -85,86 +85,115 @@ function buildExcerpt(pageTexts, pageStart, pageEnd) {
     .slice(0, 3000);
 }
 
-function normalizePathnameFromUrl(value) {
-  if (!value) return '';
-  try {
-    const url = new URL(value);
-    return decodeURIComponent(url.pathname).replace(/^\/+/, '');
-  } catch {
-    return '';
-  }
+function baseFileName(name) {
+  return String(name || '')
+    .split(/[\\/]/)
+    .pop()
+    .replace(/\.[^.]+$/, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
 }
 
-async function fetchSignedPdf(pathname, storeId, oidcToken, fileName) {
-  if (!pathname) throw new Error(`pathname kosong untuk ${fileName}.`);
+function filenameMatches(pathname, originalName) {
+  const pathBase = baseFileName(pathname);
+  const originalBase = baseFileName(originalName);
+  if (!pathBase || !originalBase) return false;
+  return pathBase.includes(originalBase);
+}
 
-  const delegation = await issueSignedToken({
-    pathname,
-    operations: ['get'],
-    validUntil: Date.now() + 10 * 60 * 1000,
-    ...(oidcToken ? { oidcToken } : {}),
-    storeId,
-  });
+async function findActualBlob(sql, book, mapel, kelas) {
+  const expectedPrefix = `books/${mapel}/${kelas}/`;
+
+  // Always verify the stored pathname first. It may already be the exact pathname.
+  if (book.blob_path) {
+    try {
+      const delegation = await issueSignedToken({
+        pathname: book.blob_path,
+        operations: ['get'],
+        validUntil: Date.now() + 5 * 60 * 1000,
+        storeId: process.env.BLOB_STORE_ID,
+      });
+      const signed = await presignUrl(delegation, {
+        operation: 'get',
+        pathname: book.blob_path,
+        access: 'private',
+        validUntil: Date.now() + 2 * 60 * 1000,
+        useCache: false,
+      });
+      const probe = await fetch(signed.presignedUrl, { method: 'HEAD', cache: 'no-store' });
+      if (probe.ok) {
+        return { pathname: book.blob_path, url: book.blob_url || '', source: 'database' };
+      }
+    } catch {
+      // Continue to Blob inventory lookup.
+    }
+  }
+
+  // Vercel Blob can add a timestamp/random suffix to the stored pathname.
+  // Resolve the actual object by its folder and original filename instead of
+  // assuming the DB pathname is still identical to the upload name.
+  const inventory = await list({ prefix: expectedPrefix, limit: 1000 });
+  const candidates = inventory.blobs
+    .filter((blob) => filenameMatches(blob.pathname, book.file_name))
+    .sort((a, b) => new Date(b.uploadedAt).getTime() - new Date(a.uploadedAt).getTime());
+
+  if (!candidates.length) {
+    throw new Error(`Blob tidak ditemukan di folder ${expectedPrefix} dengan nama yang cocok dengan ${book.file_name}.`);
+  }
+
+  const actual = candidates[0];
+
+  await sql`
+    UPDATE books
+    SET blob_path = ${actual.pathname},
+        blob_url = ${actual.url || ''},
+        file_size = ${Number(actual.size) || Number(book.file_size) || 0},
+        updated_at = NOW()
+    WHERE id = ${book.id}
+  `;
+
+  return {
+    pathname: actual.pathname,
+    url: actual.url || '',
+    source: 'blob_inventory',
+  };
+}
+
+async function loadPrivatePdf(actualPathname) {
+  const storeId = process.env.BLOB_STORE_ID;
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
+
+  if (!actualPathname) throw new Error('Pathname Blob kosong.');
+  if (!storeId) throw new Error('BLOB_STORE_ID belum tersedia di environment Vercel.');
+
+  let delegation;
+  try {
+    delegation = await issueSignedToken({
+      pathname: actualPathname,
+      operations: ['get'],
+      validUntil: Date.now() + 10 * 60 * 1000,
+      ...(oidcToken ? { oidcToken } : {}),
+      storeId,
+    });
+  } catch (error) {
+    throw new Error(`Gagal membuat signed token Blob: ${error instanceof Error ? error.message : String(error)}`);
+  }
 
   const signed = await presignUrl(delegation, {
     operation: 'get',
-    pathname,
+    pathname: actualPathname,
     access: 'private',
     validUntil: Date.now() + 5 * 60 * 1000,
     useCache: false,
   });
 
-  const response = await fetch(signed.presignedUrl, {
-    method: 'GET',
-    cache: 'no-store',
-  });
-
+  const response = await fetch(signed.presignedUrl, { method: 'GET', cache: 'no-store' });
   if (!response.ok) {
-    throw new Error(`Blob GET HTTP ${response.status} para ${pathname}`);
+    throw new Error(`Blob GET HTTP ${response.status} untuk pathname aktual ${actualPathname}.`);
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
-}
-
-async function loadPrivatePdf(sql, book) {
-  const storeId = process.env.BLOB_STORE_ID;
-  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
-  if (!storeId) throw new Error('BLOB_STORE_ID belum tersedia di environment Vercel.');
-
-  const candidates = [];
-  const storedPath = String(book.blob_path || '').trim();
-  const urlPath = normalizePathnameFromUrl(book.blob_url);
-
-  if (storedPath) candidates.push({ source: 'blob_path', pathname: storedPath });
-  if (urlPath && urlPath !== storedPath) candidates.push({ source: 'blob_url_pathname', pathname: urlPath });
-
-  if (!candidates.length) {
-    throw new Error(`Tidak ada pathname Blob untuk ${book.file_name}.`);
-  }
-
-  const errors = [];
-  for (const candidate of candidates) {
-    try {
-      const buffer = await fetchSignedPdf(candidate.pathname, storeId, oidcToken, book.file_name);
-
-      // If the database contained a stale/non-canonical pathname but the stored
-      // blob URL contains the actual Vercel-generated pathname, repair metadata.
-      if (candidate.pathname !== storedPath) {
-        await sql`
-          UPDATE books
-          SET blob_path = ${candidate.pathname}, updated_at = NOW()
-          WHERE id = ${book.id}
-        `;
-      }
-
-      return { buffer, resolvedPath: candidate.pathname, source: candidate.source };
-    } catch (error) {
-      errors.push(`${candidate.source}: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-
-  throw new Error(`PDF tidak dapat diambil dari Private Blob: ${errors.join(' | ')}`);
+  return Buffer.from(await response.arrayBuffer());
 }
 
 async function readTask(sql, task) {
@@ -198,6 +227,8 @@ async function readTask(sql, task) {
   }
 
   const book = books[0];
+  const actual = await findActualBlob(sql, book, task.mapel, klasse);
+
   const previous = await sql`
     SELECT * FROM progress
     WHERE sekolah = ${task.sekolah} AND mapel = ${task.mapel} AND kelas = ${klasse}
@@ -207,7 +238,7 @@ async function readTask(sql, task) {
   const previousEndPage = Number(progress?.halaman_akhir || 0);
   const startPage = previousEndPage > 0 ? previousEndPage + 1 : 1;
 
-  const { buffer, resolvedPath, source } = await loadPrivatePdf(sql, book);
+  const buffer = await loadPrivatePdf(actual.pathname);
   if (buffer.length < 5) throw new Error(`PDF kosong: ${book.file_name}`);
   if (buffer.subarray(0, 5).toString() !== '%PDF-') throw new Error(`Objek Blob bukan PDF valid: ${book.file_name}`);
 
@@ -227,7 +258,7 @@ async function readTask(sql, task) {
   await sql`
     UPDATE tasks
     SET status = 'book_ready',
-        book_path = ${resolvedPath},
+        book_path = ${actual.pathname},
         error_message = '',
         updated_at = NOW()
     WHERE task_id = ${task.task_id}
@@ -236,8 +267,8 @@ async function readTask(sql, task) {
   return {
     task_id: task.task_id,
     status: 'success',
-    blob_resolution: source,
-    blob_path: resolvedPath,
+    blob_resolution: actual.source,
+    blob_path: actual.pathname,
     sekolah: task.sekolah,
     mapel: task.mapel,
     kelas: klasse,
