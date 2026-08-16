@@ -105,7 +105,6 @@ function filenameMatches(pathname, originalName) {
 async function findActualBlob(sql, book, mapel, kelas) {
   const expectedPrefix = `books/${mapel}/${kelas}/`;
 
-  // Always verify the stored pathname first. It may already be the exact pathname.
   if (book.blob_path) {
     try {
       const delegation = await issueSignedToken({
@@ -126,13 +125,10 @@ async function findActualBlob(sql, book, mapel, kelas) {
         return { pathname: book.blob_path, url: book.blob_url || '', source: 'database' };
       }
     } catch {
-      // Continue to Blob inventory lookup.
+      // Fall through to inventory lookup.
     }
   }
 
-  // Vercel Blob can add a timestamp/random suffix to the stored pathname.
-  // Resolve the actual object by its folder and original filename instead of
-  // assuming the DB pathname is still identical to the upload name.
   const inventory = await list({ prefix: expectedPrefix, limit: 1000 });
   const candidates = inventory.blobs
     .filter((blob) => filenameMatches(blob.pathname, book.file_name))
@@ -153,11 +149,7 @@ async function findActualBlob(sql, book, mapel, kelas) {
     WHERE id = ${book.id}
   `;
 
-  return {
-    pathname: actual.pathname,
-    url: actual.url || '',
-    source: 'blob_inventory',
-  };
+  return { pathname: actual.pathname, url: actual.url || '', source: 'blob_inventory' };
 }
 
 async function loadPrivatePdf(actualPathname) {
@@ -167,18 +159,13 @@ async function loadPrivatePdf(actualPathname) {
   if (!actualPathname) throw new Error('Pathname Blob kosong.');
   if (!storeId) throw new Error('BLOB_STORE_ID belum tersedia di environment Vercel.');
 
-  let delegation;
-  try {
-    delegation = await issueSignedToken({
-      pathname: actualPathname,
-      operations: ['get'],
-      validUntil: Date.now() + 10 * 60 * 1000,
-      ...(oidcToken ? { oidcToken } : {}),
-      storeId,
-    });
-  } catch (error) {
-    throw new Error(`Gagal membuat signed token Blob: ${error instanceof Error ? error.message : String(error)}`);
-  }
+  const delegation = await issueSignedToken({
+    pathname: actualPathname,
+    operations: ['get'],
+    validUntil: Date.now() + 10 * 60 * 1000,
+    ...(oidcToken ? { oidcToken } : {}),
+    storeId,
+  });
 
   const signed = await presignUrl(delegation, {
     operation: 'get',
@@ -189,11 +176,68 @@ async function loadPrivatePdf(actualPathname) {
   });
 
   const response = await fetch(signed.presignedUrl, { method: 'GET', cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(`Blob GET HTTP ${response.status} untuk pathname aktual ${actualPathname}.`);
-  }
+  if (!response.ok) throw new Error(`Blob GET HTTP ${response.status} untuk pathname aktual ${actualPathname}.`);
 
   return Buffer.from(await response.arrayBuffer());
+}
+
+async function extractPdfPages(buffer) {
+  const pageTexts = [];
+
+  const pagerender = async (pageData) => {
+    const textContent = await pageData.getTextContent({
+      normalizeWhitespace: true,
+      disableCombineTextItems: false,
+    });
+
+    const lines = [];
+    let current = '';
+    let lastY = null;
+
+    for (const item of textContent.items || []) {
+      const str = String(item.str || '');
+      if (!str) continue;
+      const y = item.transform?.[5];
+      const gap = lastY !== null && typeof y === 'number' ? Math.abs(y - lastY) : 0;
+
+      if (current && gap > 4) {
+        lines.push(cleanLine(current));
+        current = '';
+      }
+
+      current += `${current ? ' ' : ''}${str}`;
+      lastY = typeof y === 'number' ? y : lastY;
+
+      if (item.hasEOL) {
+        lines.push(cleanLine(current));
+        current = '';
+      }
+    }
+
+    if (current) lines.push(cleanLine(current));
+
+    const pageText = lines.filter(Boolean).join('\n').trim();
+    pageTexts.push(pageText);
+    return pageText;
+  };
+
+  const parsed = await pdfParse(buffer, { pagerender });
+
+  // pagerender is called once per page. Sort order is preserved for normal PDF parsing.
+  const pages = pageTexts.map((text) => String(text || '').trim());
+  const totalPages = Number(parsed.numpages) || pages.length;
+
+  if (!totalPages) {
+    throw new Error('PDF tidak memiliki halaman yang terbaca.');
+  }
+
+  // 6A diagnostic: do not fake page count from form-feed characters.
+  return {
+    pages,
+    totalPages,
+    extractionMethod: 'pdf-parse-pagerender',
+    totalTextCharacters: pages.reduce((sum, page) => sum + page.length, 0),
+  };
 }
 
 async function readTask(sql, task) {
@@ -217,18 +261,11 @@ async function readTask(sql, task) {
           updated_at = NOW()
       WHERE task_id = ${task.task_id}
     `;
-    return {
-      task_id: task.task_id,
-      status: 'book_missing',
-      mapel: task.mapel,
-      kelas: klasse,
-      reason: `Tidak ada buku untuk ${task.mapel} ${klasse}.`,
-    };
+    return { task_id: task.task_id, status: 'book_missing', mapel: task.mapel, kelas: klasse, reason: `Tidak ada buku untuk ${task.mapel} ${klasse}.` };
   }
 
   const book = books[0];
   const actual = await findActualBlob(sql, book, task.mapel, klasse);
-
   const previous = await sql`
     SELECT * FROM progress
     WHERE sekolah = ${task.sekolah} AND mapel = ${task.mapel} AND kelas = ${klasse}
@@ -242,18 +279,13 @@ async function readTask(sql, task) {
   if (buffer.length < 5) throw new Error(`PDF kosong: ${book.file_name}`);
   if (buffer.subarray(0, 5).toString() !== '%PDF-') throw new Error(`Objek Blob bukan PDF valid: ${book.file_name}`);
 
-  const parsed = await pdfParse(buffer);
-  const text = String(parsed.text || '').trim();
-  if (!text) throw new Error(`PDF berhasil diambil tetapi tidak memiliki text layer: ${book.file_name}. Kemungkinan PDF hasil scan.`);
+  const extracted = await extractPdfPages(buffer);
+  const { pages: pageTexts, totalPages, extractionMethod, totalTextCharacters } = extracted;
 
-  const pageTexts = text.split('\f').map((page) => page.trim());
-  const totalPages = pageTexts.length || parsed.numpages || 0;
-  if (!totalPages) throw new Error(`Jumlah halaman PDF tidak terbaca: ${book.file_name}`);
-
-  const boundedStart = Math.min(Math.max(1, startPage), totalPages);
-  const boundedEnd = Math.min(totalPages, boundedStart + 3);
-  const selection = findChapterAndSubchapter(pageTexts, boundedStart);
-  const excerpt = buildExcerpt(pageTexts, boundedStart, boundedEnd);
+  const safeStart = Math.min(Math.max(1, startPage), totalPages);
+  const safeEnd = Math.min(totalPages, safeStart + 3);
+  const selection = findChapterAndSubchapter(pageTexts, safeStart);
+  const excerpt = buildExcerpt(pageTexts, safeStart, safeEnd);
 
   await sql`
     UPDATE tasks
@@ -275,9 +307,16 @@ async function readTask(sql, task) {
     pertemuan: task.pertemuan_berikutnya,
     buku: book.nama_buku,
     file_name: book.file_name,
+    extraction_method: extractionMethod,
     total_halaman: totalPages,
-    halaman_awal: boundedStart,
-    halaman_akhir: boundedEnd,
+    total_text_characters: totalTextCharacters,
+    halaman_awal: safeStart,
+    halaman_akhir: safeEnd,
+    preview_halaman: pageTexts.slice(0, 3).map((text, index) => ({
+      halaman: index + 1,
+      karakter: text.length,
+      cuplikan: text.slice(0, 500),
+    })),
     bab: selection.bab,
     subbab: selection.subbab,
     halaman_bab: selection.chapterPage,
