@@ -1,4 +1,4 @@
-import { sql } from '@neondatabase/serverless';
+import { neon } from '@neondatabase/serverless';
 
 async function getDatabaseStatus() {
   if (!process.env.DATABASE_URL) {
@@ -6,6 +6,7 @@ async function getDatabaseStatus() {
   }
 
   try {
+    const sql = neon(process.env.DATABASE_URL);
     const rows = await sql`
       SELECT
         (SELECT COUNT(*)::int FROM jadwal) AS jadwal,
@@ -16,7 +17,10 @@ async function getDatabaseStatus() {
     `;
     return { connected: true, ...rows[0] };
   } catch (error) {
-    return { connected: false, reason: error instanceof Error ? error.message : 'Database error' };
+    return {
+      connected: false,
+      reason: error instanceof Error ? error.message : 'Database error'
+    };
   }
 }
 
