@@ -12,7 +12,6 @@
     "@vercel/blob": "^2.4.0",
     "next": "^15.5.0",
     "pdf-parse": "^1.1.1",
-    "pdfjs-dist": "^5.4.54",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   }
