@@ -1,5 +1,5 @@
 import { neon } from '@neondatabase/serverless';
-import { get } from '@vercel/blob';
+import { issueSignedToken, presignUrl } from '@vercel/blob';
 import pdfParse from 'pdf-parse';
 
 export const runtime = 'nodejs';
@@ -80,12 +80,7 @@ function findChapterAndSubchapter(pageTexts, startPage) {
     subchapterPage = Math.max(1, startPage);
   }
 
-  return {
-    bab: chapter,
-    subbab: subchapter,
-    chapterPage,
-    subchapterPage,
-  };
+  return { bab: chapter, subbab: subchapter, chapterPage, subchapterPage };
 }
 
 function buildExcerpt(pageTexts, pageStart, pageEnd) {
@@ -95,6 +90,39 @@ function buildExcerpt(pageTexts, pageStart, pageEnd) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 2200);
+}
+
+async function fetchPrivatePdf(pathname, fileName) {
+  if (!pathname) throw new Error(`Path PDF kosong untuk ${fileName}`);
+
+  const validUntil = Date.now() + 5 * 60 * 1000;
+  const token = await issueSignedToken({
+    pathname,
+    operations: ['get'],
+    validUntil,
+  });
+
+  const { presignedUrl } = await presignUrl(token, {
+    pathname,
+    operation: 'get',
+    validUntil,
+  });
+
+  const response = await fetch(presignedUrl, { cache: 'no-store' });
+
+  if (!response.ok) {
+    throw new Error(`PDF tidak dapat diambil dari Private Blob (${response.status}) untuk ${fileName}`);
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.toLowerCase().includes('pdf') && !contentType.toLowerCase().includes('octet-stream')) {
+    throw new Error(`Objek ${fileName} bukan PDF (content-type: ${contentType || 'tidak diketahui'})`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  if (!arrayBuffer.byteLength) throw new Error(`PDF kosong: ${fileName}`);
+
+  return Buffer.from(arrayBuffer);
 }
 
 async function readTask(sql, task) {
@@ -147,21 +175,15 @@ async function readTask(sql, task) {
   const previousEndPage = Number(progress?.halaman_akhir || 0);
   const startPage = previousEndPage > 0 ? previousEndPage + 1 : 1;
 
-  const result = await get(book.blob_path, {
-    access: 'private',
-    useCache: false,
-  });
-
-  if (!result?.stream) {
-    throw new Error(`Isi PDF tidak dapat dibaca: ${book.file_name}`);
-  }
-
-  const arrayBuffer = await new Response(result.stream).arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
+  const buffer = await fetchPrivatePdf(book.blob_path, book.file_name);
   const parsed = await pdfParse(buffer);
   const pageTexts = String(parsed.text || '')
     .split('\f')
     .map((page) => page.trim());
+
+  if (!pageTexts.length || !String(parsed.text || '').trim()) {
+    throw new Error(`PDF ${book.file_name} berhasil diambil tetapi tidak memiliki teks yang dapat diekstrak. Mungkin PDF hasil scan.`);
+  }
 
   const boundedStart = Math.min(Math.max(1, startPage), Math.max(1, pageTexts.length));
   const boundedEnd = Math.min(pageTexts.length, boundedStart + 3);
@@ -211,11 +233,7 @@ export async function POST(request) {
     const tanggal = body.tanggal ? String(body.tanggal) : null;
 
     if (!taskId && !tanggal) {
-      return Response.json({
-        agent: 'book_reader',
-        status: 'error',
-        reason: 'Kirim task_id atau tanggal.'
-      }, { status: 400 });
+      return Response.json({ agent: 'book_reader', status: 'error', reason: 'Kirim task_id atau tanggal.' }, { status: 400 });
     }
 
     const tasks = taskId
@@ -223,17 +241,12 @@ export async function POST(request) {
       : await sql`
           SELECT * FROM tasks
           WHERE tanggal = ${tanggal}
-            AND status IN ('progress_ready', 'book_ready')
+            AND status IN ('progress_ready', 'book_ready', 'book_error')
           ORDER BY jam_mulai NULLS LAST, task_id
         `;
 
     if (!tasks.length) {
-      return Response.json({
-        agent: 'book_reader',
-        status: 'no_tasks',
-        tanggal,
-        tasks: [],
-      });
+      return Response.json({ agent: 'book_reader', status: 'no_tasks', tanggal, tasks: [] });
     }
 
     const results = [];
@@ -256,12 +269,7 @@ export async function POST(request) {
       }
     }
 
-    return Response.json({
-      agent: 'book_reader',
-      status: 'success',
-      tanggal: tanggal || tasks[0]?.tanggal,
-      tasks: results,
-    });
+    return Response.json({ agent: 'book_reader', status: 'success', tanggal: tanggal || tasks[0]?.tanggal, tasks: results });
   } catch (error) {
     console.error('Book Reader error:', error);
     return Response.json({
