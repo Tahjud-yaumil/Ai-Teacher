@@ -1,8 +1,9 @@
 import { neon } from '@neondatabase/serverless';
-import { issueSignedToken, presignUrl } from '@vercel/blob';
+import { get } from '@vercel/blob';
 import pdfParse from 'pdf-parse';
 
 export const runtime = 'nodejs';
+export const maxDuration = 300;
 
 function getSql() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL belum tersedia.');
@@ -35,7 +36,6 @@ function findChapterAndSubchapter(pageTexts, startPage) {
 
   for (let i = Math.max(0, startPage - 1); i < pageTexts.length; i += 1) {
     const lines = pageTexts[i].split('\n').map(cleanLine).filter(Boolean);
-
     for (const line of lines) {
       if (/^BAB\s+/i.test(line)) {
         chapterIndex = i;
@@ -44,12 +44,11 @@ function findChapterAndSubchapter(pageTexts, startPage) {
         break;
       }
     }
-
     if (chapterIndex >= 0) break;
   }
 
   const searchFrom = chapterIndex >= 0 ? chapterIndex : Math.max(0, startPage - 1);
-  for (let i = searchFrom; i < Math.min(pageTexts.length, searchFrom + 8); i += 1) {
+  for (let i = searchFrom; i < Math.min(pageTexts.length, searchFrom + 12); i += 1) {
     const lines = pageTexts[i].split('\n').map(cleanLine).filter(Boolean);
     for (const line of lines) {
       if (!looksLikeHeading(line)) continue;
@@ -63,19 +62,13 @@ function findChapterAndSubchapter(pageTexts, startPage) {
   }
 
   if (!chapter) {
-    const fallback = pageTexts[Math.max(0, startPage - 1)]
-      ?.split('\n')
-      .map(cleanLine)
-      .find(looksLikeHeading);
+    const fallback = pageTexts[Math.max(0, startPage - 1)]?.split('\n').map(cleanLine).find(looksLikeHeading);
     chapter = fallback || 'Materi berikutnya';
     chapterPage = Math.max(1, startPage);
   }
 
   if (!subchapter) {
-    const fallback = pageTexts[Math.max(0, startPage - 1)]
-      ?.split('\n')
-      .map(cleanLine)
-      .find((line) => looksLikeHeading(line) && line !== chapter);
+    const fallback = pageTexts[Math.max(0, startPage - 1)]?.split('\n').map(cleanLine).find((line) => looksLikeHeading(line) && line !== chapter);
     subchapter = fallback || 'Subbab berikutnya';
     subchapterPage = Math.max(1, startPage);
   }
@@ -89,126 +82,125 @@ function buildExcerpt(pageTexts, pageStart, pageEnd) {
     .join('\n')
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 2200);
+    .slice(0, 3000);
 }
 
-async function fetchPrivatePdf(pathname, fileName) {
-  if (!pathname) throw new Error(`Path PDF kosong untuk ${fileName}`);
+async function loadPrivatePdf(book) {
+  const pathname = book.blob_path;
+  const url = book.blob_url;
+  const storeId = process.env.BLOB_STORE_ID;
+  const oidcToken = process.env.VERCEL_OIDC_TOKEN;
 
-  const validUntil = Date.now() + 5 * 60 * 1000;
-  const token = await issueSignedToken({
-    pathname,
-    operations: ['get'],
-    validUntil,
-  });
+  const attempts = [];
+  if (url) attempts.push({ label: 'blob_url', target: url });
+  if (pathname) attempts.push({ label: 'blob_path', target: pathname });
 
-  const { presignedUrl } = await presignUrl(token, {
-    pathname,
-    operation: 'get',
-    validUntil,
-  });
+  let lastError = null;
 
-  const response = await fetch(presignedUrl, { cache: 'no-store' });
+  for (const attempt of attempts) {
+    try {
+      const options = {
+        access: 'private',
+        useCache: false,
+        ...(storeId ? { storeId } : {}),
+        ...(oidcToken ? { oidcToken } : {}),
+      };
 
-  if (!response.ok) {
-    throw new Error(`PDF tidak dapat diambil dari Private Blob (${response.status}) untuk ${fileName}`);
+      const result = await get(attempt.target, options);
+
+      if (!result) {
+        lastError = new Error(`${attempt.label}: blob tidak ditemukan`);
+        continue;
+      }
+
+      if (result.statusCode && result.statusCode !== 200) {
+        lastError = new Error(`${attempt.label}: Blob HTTP ${result.statusCode}`);
+        continue;
+      }
+
+      if (!result.stream) {
+        lastError = new Error(`${attempt.label}: response tidak memiliki stream`);
+        continue;
+      }
+
+      return { result, source: attempt.label };
+    } catch (error) {
+      lastError = error;
+    }
   }
 
-  const contentType = response.headers.get('content-type') || '';
-  if (!contentType.toLowerCase().includes('pdf') && !contentType.toLowerCase().includes('octet-stream')) {
-    throw new Error(`Objek ${fileName} bukan PDF (content-type: ${contentType || 'tidak diketahui'})`);
-  }
-
-  const arrayBuffer = await response.arrayBuffer();
-  if (!arrayBuffer.byteLength) throw new Error(`PDF kosong: ${fileName}`);
-
-  return Buffer.from(arrayBuffer);
+  const detail = lastError instanceof Error ? lastError.message : 'unknown fetch error';
+  throw new Error(`PDF tidak dapat diambil dari Private Blob (${detail}).`);
 }
 
 async function readTask(sql, task) {
   if (!task.requires_book) {
-    return {
-      task_id: task.task_id,
-      status: 'not_required',
-      reason: 'Task ini tidak membutuhkan buku pegangan.',
-    };
+    return { task_id: task.task_id, status: 'not_required', reason: 'Task ini tidak membutuhkan buku pegangan.' };
   }
 
   const klasse = task.jenis_kegiatan === 'Ekstrakurikuler' ? '-' : task.kelas;
   const books = await sql`
     SELECT * FROM books
-    WHERE aktif = TRUE
-      AND mapel = ${task.mapel}
-      AND kelas = ${klasse}
+    WHERE aktif = TRUE AND mapel = ${task.mapel} AND kelas = ${klasse}
     ORDER BY created_at DESC
     LIMIT 1
   `;
 
   if (!books.length) {
     await sql`
-      UPDATE tasks
-      SET status = 'book_missing',
-          book_path = '',
-          error_message = ${`Buku ${task.mapel} kelas ${klasse} belum tersedia.`},
-          updated_at = NOW()
+      UPDATE tasks SET status = 'book_missing', book_path = '', error_message = ${`Buku ${task.mapel} kelas ${klasse} belum tersedia.`}, updated_at = NOW()
       WHERE task_id = ${task.task_id}
     `;
-
-    return {
-      task_id: task.task_id,
-      status: 'book_missing',
-      mapel: task.mapel,
-      kelas: klasse,
-      reason: `Tidak ada buku untuk ${task.mapel} ${klasse}.`,
-    };
+    return { task_id: task.task_id, status: 'book_missing', mapel: task.mapel, kelas: klasse, reason: `Tidak ada buku untuk ${task.mapel} ${klasse}.` };
   }
 
   const book = books[0];
   const previous = await sql`
     SELECT * FROM progress
-    WHERE sekolah = ${task.sekolah}
-      AND mapel = ${task.mapel}
-      AND kelas = ${klasse}
+    WHERE sekolah = ${task.sekolah} AND mapel = ${task.mapel} AND kelas = ${klasse}
     LIMIT 1
   `;
   const progress = previous[0] || null;
   const previousEndPage = Number(progress?.halaman_akhir || 0);
   const startPage = previousEndPage > 0 ? previousEndPage + 1 : 1;
 
-  const buffer = await fetchPrivatePdf(book.blob_path, book.file_name);
+  const { result, source } = await loadPrivatePdf(book);
+  const arrayBuffer = await new Response(result.stream).arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  if (buffer.length < 5) throw new Error(`PDF kosong: ${book.file_name}`);
+  if (buffer.subarray(0, 5).toString() !== '%PDF-') throw new Error(`Objek Blob bukan PDF valid: ${book.file_name}`);
+
   const parsed = await pdfParse(buffer);
-  const pageTexts = String(parsed.text || '')
-    .split('\f')
-    .map((page) => page.trim());
+  const text = String(parsed.text || '').trim();
+  if (!text) throw new Error(`PDF berhasil diambil tetapi tidak memiliki text layer: ${book.file_name}. Kemungkinan PDF hasil scan.`);
 
-  if (!pageTexts.length || !String(parsed.text || '').trim()) {
-    throw new Error(`PDF ${book.file_name} berhasil diambil tetapi tidak memiliki teks yang dapat diekstrak. Mungkin PDF hasil scan.`);
-  }
+  const pageTexts = text.split('\f').map((page) => page.trim());
+  const totalPages = pageTexts.length || parsed.numpages || 0;
+  if (!totalPages) throw new Error(`Jumlah halaman PDF tidak terbaca: ${book.file_name}`);
 
-  const boundedStart = Math.min(Math.max(1, startPage), Math.max(1, pageTexts.length));
-  const boundedEnd = Math.min(pageTexts.length, boundedStart + 3);
+  const boundedStart = Math.min(Math.max(1, startPage), totalPages);
+  const boundedEnd = Math.min(totalPages, boundedStart + 3);
   const selection = findChapterAndSubchapter(pageTexts, boundedStart);
   const excerpt = buildExcerpt(pageTexts, boundedStart, boundedEnd);
 
   await sql`
     UPDATE tasks
-    SET status = 'book_ready',
-        book_path = ${book.blob_path},
-        updated_at = NOW(),
-        error_message = ''
+    SET status = 'book_ready', book_path = ${book.blob_path}, updated_at = NOW(), error_message = ''
     WHERE task_id = ${task.task_id}
   `;
 
   return {
     task_id: task.task_id,
     status: 'success',
+    source,
     sekolah: task.sekolah,
     mapel: task.mapel,
     kelas: klasse,
     pertemuan: task.pertemuan_berikutnya,
     buku: book.nama_buku,
     file_name: book.file_name,
-    total_halaman: pageTexts.length || parsed.numpages || 0,
+    total_halaman: totalPages,
     halaman_awal: boundedStart,
     halaman_akhir: boundedEnd,
     bab: selection.bab,
@@ -245,37 +237,25 @@ export async function POST(request) {
           ORDER BY jam_mulai NULLS LAST, task_id
         `;
 
-    if (!tasks.length) {
-      return Response.json({ agent: 'book_reader', status: 'no_tasks', tanggal, tasks: [] });
-    }
+    if (!tasks.length) return Response.json({ agent: 'book_reader', status: 'no_tasks', tanggal, tasks: [] });
 
     const results = [];
     for (const task of tasks) {
       try {
         results.push(await readTask(sql, task));
       } catch (error) {
+        const message = error instanceof Error ? error.message : 'Book Reader gagal membaca PDF.';
         await sql`
-          UPDATE tasks
-          SET status = 'book_error',
-              error_message = ${error instanceof Error ? error.message : 'Book Reader gagal membaca PDF.'},
-              updated_at = NOW()
+          UPDATE tasks SET status = 'book_error', error_message = ${message}, updated_at = NOW()
           WHERE task_id = ${task.task_id}
         `;
-        results.push({
-          task_id: task.task_id,
-          status: 'error',
-          error: error instanceof Error ? error.message : 'Book Reader gagal membaca PDF.',
-        });
+        results.push({ task_id: task.task_id, status: 'error', error: message });
       }
     }
 
     return Response.json({ agent: 'book_reader', status: 'success', tanggal: tanggal || tasks[0]?.tanggal, tasks: results });
   } catch (error) {
     console.error('Book Reader error:', error);
-    return Response.json({
-      agent: 'book_reader',
-      status: 'error',
-      reason: error instanceof Error ? error.message : 'Book Reader gagal dijalankan.'
-    }, { status: 500 });
+    return Response.json({ agent: 'book_reader', status: 'error', reason: error instanceof Error ? error.message : 'Book Reader gagal dijalankan.' }, { status: 500 });
   }
 }
