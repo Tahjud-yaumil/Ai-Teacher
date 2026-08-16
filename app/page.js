@@ -1,4 +1,5 @@
 import { neon } from '@neondatabase/serverless';
+import SchedulerPanel from './scheduler-panel';
 
 async function getDatabaseStatus() {
   if (!process.env.DATABASE_URL) {
@@ -19,7 +20,7 @@ async function getDatabaseStatus() {
   } catch (error) {
     return {
       connected: false,
-      reason: error instanceof Error ? error.message : 'Database error'
+      reason: error instanceof Error ? error.message : 'Database error',
     };
   }
 }
@@ -68,6 +69,8 @@ export default async function Home() {
             Scheduler → Progress Manager → Book Reader → Content Generator → Quality Reviewer → Publisher → Telegram.
           </p>
         </div>
+
+        <SchedulerPanel />
       </section>
     </main>
   );
