@@ -19,9 +19,15 @@ function isNoise(line){const t=norm(line);return !t||/^\d{1,4}$/.test(t)||/^[ivx
 
 function sqlClient(){
   const e=env();
-  const url=e.DATABASE_URL || e.POSTGRES_PRISMA_URL || e.POSTGRES_URL || e.DATABASE_URL_UNPOOLED;
-  if(!url) throw new Error('DATABASE_URL/POSTGRES_URL belum tersedia di environment Vercel.');
-  return neon(url);
+  const candidates=[
+    ['DATABASE_URL',e.DATABASE_URL],
+    ['POSTGRES_PRISMA_URL',e.POSTGRES_PRISMA_URL],
+    ['POSTGRES_URL',e.POSTGRES_URL],
+    ['DATABASE_URL_UNPOOLED',e.DATABASE_URL_UNPOOLED]
+  ];
+  const found=candidates.find(([,value])=>typeof value==='string'&&value.trim());
+  if(!found) throw new Error('Database connection variable tidak tersedia. Pastikan POSTGRES_PRISMA_URL atau DATABASE_URL ada di Environment Variables, lalu buat deployment baru.');
+  return { sql: neon(found[1]), source: found[0] };
 }
 
 async function resolveBlob(sql,book,mapel,kelas){
@@ -61,4 +67,4 @@ async function process(sql,task){
   return{task_id:task.task_id,status:'success',context_valid:context.length>200&&selected.length>0&&contamination===0,blob_path:blob.pathname,mapel:task.mapel,kelas,buku:book.nama_buku,bab:unitName,subbab:`${sub.label}. ${sub.title}`,halaman_awal:selected[0]?.page||start,halaman_akhir:selected.at(-1)?.page||end,total_context_characters:context.length,contamination_pages:contamination,pages:selected.map(x=>x.page),context};
 }
 
-export async function POST(request){try{const body=await request.json().catch(()=>({}));const sql=sqlClient();const taskId=body.task_id?String(body.task_id):null;const tanggal=body.tanggal?String(body.tanggal):null;if(!taskId&&!tanggal)return Response.json({agent:'context_extractor',status:'error',reason:'Kirim task_id atau tanggal.'},{status:400});const tasks=taskId?await sql`SELECT * FROM tasks WHERE task_id=${taskId} LIMIT 1`:await sql`SELECT * FROM tasks WHERE tanggal=${tanggal} AND status IN ('book_ready','progress_ready','book_error') ORDER BY task_id`;if(!tasks.length)return Response.json({agent:'context_extractor',status:'no_tasks',tanggal,tasks:[]});const results=[];for(const task of tasks){try{results.push(await process(sql,task));}catch(e){results.push({task_id:task.task_id,status:'error',error:e instanceof Error?e.message:'Context Extractor gagal.'});}}return Response.json({agent:'context_extractor',status:'success',tanggal:tanggal||tasks[0]?.tanggal,tasks:results});}catch(e){return Response.json({agent:'context_extractor',status:'error',reason:e instanceof Error?e.message:'Context Extractor gagal.'},{status:500});}}
+export async function POST(request){try{const body=await request.json().catch(()=>({}));const {sql,source}=sqlClient();const taskId=body.task_id?String(body.task_id):null;const tanggal=body.tanggal?String(body.tanggal):null;if(!taskId&&!tanggal)return Response.json({agent:'context_extractor',status:'error',reason:'Kirim task_id atau tanggal.'},{status:400});const tasks=taskId?await sql`SELECT * FROM tasks WHERE task_id=${taskId} LIMIT 1`:await sql`SELECT * FROM tasks WHERE tanggal=${tanggal} AND status IN ('book_ready','progress_ready','book_error') ORDER BY task_id`;if(!tasks.length)return Response.json({agent:'context_extractor',status:'no_tasks',tanggal,tasks:[]});const results=[];for(const task of tasks){try{results.push(await process(sql,task));}catch(e){results.push({task_id:task.task_id,status:'error',error:e instanceof Error?e.message:'Context Extractor gagal.'});}}return Response.json({agent:'context_extractor',status:'success',tanggal:tanggal||tasks[0]?.tanggal,database_source:source,tasks:results});}catch(e){return Response.json({agent:'context_extractor',status:'error',reason:e instanceof Error?e.message:'Context Extractor gagal.'},{status:500});}}
