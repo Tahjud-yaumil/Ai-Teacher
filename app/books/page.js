@@ -1,7 +1,6 @@
 'use client';
 
 import { useState } from 'react';
-import { upload } from '@vercel/blob/client';
 
 const MAPEL = ['IPS', 'IPA', 'Informatika'];
 const KELAS = ['VII', 'VIII', 'IX'];
@@ -24,6 +23,7 @@ export default function BooksPage() {
   const [file, setFile] = useState(null);
   const [status, setStatus] = useState('');
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState(0);
 
   async function handleSubmit(event) {
     event.preventDefault();
@@ -44,20 +44,39 @@ export default function BooksPage() {
     }
 
     setLoading(true);
-    setStatus('Menyiapkan upload...');
+    setProgress(0);
+    setStatus('Menyiapkan upload aman...');
 
     try {
-      const blob = await upload(
-        `books/${form.mapel}/${form.kelas}/${file.name}`,
-        file,
-        {
-          access: 'private',
-          handleUploadUrl: '/api/books/upload',
-          clientPayload: JSON.stringify({ source: 'yaumiteach-books' }),
-          multipart: true,
-        }
-      );
+      const presignResponse = await fetch('/api/books/presign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          mapel: form.mapel,
+          kelas: form.kelas,
+          size: file.size,
+          contentType: file.type,
+        }),
+      });
 
+      const presignData = await presignResponse.json();
+      if (!presignResponse.ok) throw new Error(presignData.error || 'Gagal menyiapkan upload.');
+
+      setStatus('Mengupload PDF langsung ke Private Blob...');
+
+      const uploadResponse = await fetch(presignData.presignedUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': file.type },
+        body: file,
+      });
+
+      if (!uploadResponse.ok) {
+        const text = await uploadResponse.text().catch(() => '');
+        throw new Error(`Upload Blob gagal (${uploadResponse.status}). ${text}`.trim());
+      }
+
+      setProgress(100);
       setStatus('PDF berhasil diupload. Menyimpan metadata...');
 
       const response = await fetch('/api/books/register', {
@@ -67,8 +86,8 @@ export default function BooksPage() {
           ...form,
           tahun: form.tahun || null,
           file_name: file.name,
-          blob_path: blob.pathname,
-          blob_url: blob.url,
+          blob_path: presignData.pathname,
+          blob_url: '',
           file_size: file.size,
           mime_type: file.type,
         }),
@@ -94,7 +113,7 @@ export default function BooksPage() {
         <p style={{ color: '#888', fontSize: 13 }}>YAUMITEACH / BUKU PEGANGAN</p>
         <h1 style={{ marginBottom: 8 }}>Upload Buku PDF</h1>
         <p style={{ color: '#aaa', lineHeight: 1.6 }}>
-          Buku disimpan di Private Vercel Blob. Metadata buku disimpan di Neon untuk digunakan Book Reader.
+          PDF diunggah langsung ke Private Vercel Blob menggunakan signed upload URL. Kredensial Blob tidak dikirim ke browser.
         </p>
 
         <form onSubmit={handleSubmit} style={{ marginTop: 28, background: '#111', border: '1px solid #262626', borderRadius: 18, padding: 24, display: 'grid', gap: 18 }}>
@@ -134,6 +153,15 @@ export default function BooksPage() {
             <input required type="file" accept="application/pdf,.pdf" onChange={(e) => setFile(e.target.files?.[0] || null)} style={{ color: '#ddd' }} />
             {file && <small style={{ color: '#999' }}>{file.name} — {formatBytes(file.size)}</small>}
           </label>
+
+          {loading && (
+            <div style={{ display: 'grid', gap: 8 }}>
+              <div style={{ height: 8, background: '#222', borderRadius: 999, overflow: 'hidden' }}>
+                <div style={{ width: `${Math.max(progress, 8)}%`, height: '100%', background: '#fff', transition: 'width 150ms ease' }} />
+              </div>
+              <small style={{ color: '#888' }}>{progress}%</small>
+            </div>
+          )}
 
           <button disabled={loading} type="submit" style={{ background: '#fff', color: '#000', border: 0, borderRadius: 10, padding: '13px 18px', fontWeight: 700, cursor: loading ? 'wait' : 'pointer' }}>
             {loading ? 'Mengupload…' : 'Upload Buku'}
