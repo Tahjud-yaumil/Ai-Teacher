@@ -23,10 +23,14 @@ function envDiagnostics(){
   const present={};
   for(const name of names) present[name]=typeof e[name]==='string' && e[name].trim().length>0;
   return {
+    diagnostic_version: 'env-diagnostics-2',
     present,
-    relevant_keys: Object.keys(e).filter(k=>/^(DATABASE|POSTGRES|PG|NEON)_/i.test(k)).sort(),
+    yaumiteach_test_present: typeof e.YAUMITEACH_TEST === 'string' && e.YAUMITEACH_TEST.trim().length > 0,
+    relevant_keys: Object.keys(e).filter(k=>/^(DATABASE|POSTGRES|PG|NEON|YAUMITEACH)_/i.test(k)).sort(),
     node_env: e.NODE_ENV || null,
     vercel_env: e.VERCEL_ENV || null,
+    vercel_target_env: e.VERCEL_TARGET_ENV || null,
+    deployment_id_present: Boolean(e.VERCEL_DEPLOYMENT_ID),
   };
 }
 
@@ -93,4 +97,4 @@ async function process(sql,task){
   return{task_id:task.task_id,status:'success',context_valid:context.length>200&&selected.length>0&&contamination===0,blob_path:blob.pathname,mapel:task.mapel,kelas,buku:book.nama_buku,bab:unitName,subbab:`${sub.label}. ${sub.title}`,halaman_awal:selected[0]?.page||start,halaman_akhir:selected.at(-1)?.page||end,total_context_characters:context.length,contamination_pages:contamination,pages:selected.map(x=>x.page),context};
 }
 
-export async function POST(request){try{const body=await request.json().catch(()=>({}));const db=sqlClient();const sql=db.sql;const taskId=body.task_id?String(body.task_id):null;const tanggal=body.tanggal?String(body.tanggal):null;if(!taskId&&!tanggal)return Response.json({agent:'context_extractor',status:'error',reason:'Kirim task_id atau tanggal.'},{status:400});const tasks=taskId?await sql`SELECT * FROM tasks WHERE task_id=${taskId} LIMIT 1`:await sql`SELECT * FROM tasks WHERE tanggal=${tanggal} AND status IN ('book_ready','progress_ready','book_error') ORDER BY task_id`;if(!tasks.length)return Response.json({agent:'context_extractor',status:'no_tasks',tanggal,tasks:[]});const results=[];for(const task of tasks){try{results.push(await process(sql,task));}catch(e){results.push({task_id:task.task_id,status:'error',error:e instanceof Error?e.message:'Context Extractor gagal.'});}}return Response.json({agent:'context_extractor',status:'success',tanggal:tanggal||tasks[0]?.tanggal,database_source:db.source,tasks:results});}catch(e){console.error('Context Extractor error:',e);return Response.json({agent:'context_extractor',status:'error',reason:e instanceof Error?e.message:'Context Extractor gagal.'},{status:500});}}
+export async function POST(request){try{const body=await request.json().catch(()=>({}));const db=sqlClient();const sql=db.sql;const taskId=body.task_id?String(body.task_id):null;const tanggal=body.tanggal?String(body.tanggal):null;if(!taskId&&!tanggal)return Response.json({agent:'context_extractor',status:'error',reason:'Kirim task_id atau tanggal.'},{status:400});const tasks=taskId?await sql`SELECT * FROM tasks WHERE task_id=${taskId} LIMIT 1`:await sql`SELECT * FROM tasks WHERE tanggal=${tanggal} AND status IN ('book_ready','progress_ready','book_error') ORDER BY task_id`;if(!tasks.length)return Response.json({agent:'context_extractor',status:'no_tasks',tanggal,tasks:[]});const results=[];for(const task of tasks){try{results.push(await process(sql,task));}catch(e){results.push({task_id:task.task_id,status:'error',error:e instanceof Error?e.message:'Context Extractor gagal.'});}}return Response.json({agent:'context_extractor',status:'success',tanggal:tanggal||tasks[0]?.tanggal,database_source:db.source,runtime_diagnostics:db.diagnostics,tasks:results});}catch(e){console.error('Context Extractor error:',e);return Response.json({agent:'context_extractor',status:'error',reason:e instanceof Error?e.message:'Context Extractor gagal.'},{status:500});}}
