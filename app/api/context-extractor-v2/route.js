@@ -38,7 +38,7 @@ async function process(sql,task){
   const toc=findToc(pages);const units=tocUnits(pages,toc);const unit=units[0]||null;const actual=unit?findUnitPage(pages,toc,unit):null;
   if(!actual)throw new Error(`Tidak dapat menemukan awal unit materi untuk ${task.mapel} ${kelas}.`);
   const sub=findSubPage(pages,actual.page)||{page:actual.page,label:'A',title:'Subbab berikutnya'};const start=Math.max(1,anchor?anchor+1:sub.page);const endRaw=nextSubPage(pages,start,sub.label);const end=Math.min(totalPages,endRaw>=0?endRaw:sub.page+8);const pageIndexes=[];for(let i=start-1;i<end;i++)pageIndexes.push(i);
-  const selected=pageIndexes.map(i=>({page:i+1,text:cleanPage(pages[i],unit.title)})).filter(x=>x.text.length>40);const context=selected.map(x=>`[Halaman ${x.page}] ${x.text}`).join('\n\n').slice(0,18000);const bad=selected.filter(x=>/\b(?:Bab|Tema)\s+[2-9IVX]+\b/i.test(x.text)&&!sim(x.text,unit.title)>=0.25).length;
+  const selected=pageIndexes.map(i=>({page:i+1,text:cleanPage(pages[i],unit.title)})).filter(x=>x.text.length>40);const context=selected.map(x=>`[Halaman ${x.page}] ${x.text}`).join('\n\n').slice(0,18000);const bad=selected.filter(x=>{const t=norm(x.text);const units=t.match(/\b(?:bab|tema)\s+[2-9ivx]+\b/gi)||[];return units.length>0 && sim(t,unit.title)<0.25;}).length;
   return{task_id:task.task_id,status:'success',context_valid:context.length>200&&bad===0,blob_path:pathname,mapel:task.mapel,kelas,buku:book.nama_buku,bab:`${unit.type==='tema'?'Tema':'Bab'} ${unit.roman} ${unit.title}`,subbab:`${sub.label}. ${sub.title}`,halaman_awal:selected[0]?.page||start,halaman_akhir:selected.at(-1)?.page||end,total_context_characters:context.length,contamination_pages:bad,pages:selected.map(x=>x.page),context};
 }
 
