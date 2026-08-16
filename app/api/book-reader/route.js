@@ -11,6 +11,7 @@ function getSql() {
 }
 
 const clean = (v) => String(v || '').replace(/\s+/g, ' ').trim();
+const deaccent = (v) => clean(v).toLowerCase().replace(/[^a-z0-9\s.-]/gi, ' ');
 
 function isFrontMatter(text) {
   const t = String(text || '').toLowerCase();
@@ -18,32 +19,149 @@ function isFrontMatter(text) {
     'kata pengantar', 'daftar isi', 'daftar gambar', 'daftar tabel',
     'petunjuk penggunaan', 'glosarium', 'indeks', 'biodata penulis',
     'profil penulis', 'hak cipta', 'isbn', 'dilindungi undang-undang',
-    'kementerian pendidikan', 'kementerian agama', 'diterbitkan oleh'
+    'kementerian pendidikan', 'kementerian agama', 'diterbitkan oleh',
+    'prakata', 'penjelasan fitur buku'
   ].some((x) => t.includes(x));
 }
 
 function chapterHeading(line) {
   const v = clean(line);
-  if (v.length < 5 || v.length > 140) return false;
+  if (v.length < 5 || v.length > 180) return false;
   if ((v.match(/\.{3,}/g) || []).length) return false;
   return /^BAB\s+(?:[IVXLC]+|\d+)\b/i.test(v) || /^BAB\s+\S+/i.test(v);
 }
 
-function subchapterHeading(line) {
-  const v = clean(line);
-  if (v.length < 5 || v.length > 140) return false;
-  if (/^BAB\s+/i.test(v)) return false;
-  if (/^(KEMENTERIAN|ISBN|HAK CIPTA|KATA PENGANTAR|DAFTAR ISI|DAFTAR GAMBAR|DAFTAR TABEL)$/i.test(v)) return false;
-  if ((v.match(/\.{3,}/g) || []).length) return false;
-  return /^\d+(?:\.\d+)+\s+\S+/.test(v) || /^[A-Z]\s*\.\s+\S+/.test(v) || /^[A-Z][A-Z0-9 &,:()'-]{8,}$/.test(v);
+function extractChapterNumber(line) {
+  const m = clean(line).match(/^BAB\s+([IVXLC]+|\d+)\b/i);
+  return m ? m[1].toUpperCase() : '';
+}
+
+function normalizeChapterNumber(v) {
+  const s = String(v || '').toUpperCase();
+  if (/^\d+$/.test(s)) return Number(s);
+  const map = { I: 1, II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8, IX: 9, X: 10, XI: 11, XII: 12 };
+  return map[s] || null;
+}
+
+function chapterTitleFromHeading(line) {
+  const v = clean(line).replace(/^BAB\s+(?:[IVXLC]+|\d+)\s*/i, '');
+  return clean(v.replace(/\s+\d{1,3}\s*$/, ''));
+}
+
+function significantTokens(text) {
+  return deaccent(text)
+    .split(/\s+/)
+    .map((x) => x.replace(/^[.\d-]+|[.\d-]+$/g, ''))
+    .filter((x) => x.length >= 4 && !['yang', 'dengan', 'untuk', 'dari', 'pada', 'dalam', 'manusia', 'kelas'].includes(x));
+}
+
+function tokenSimilarity(a, b) {
+  const A = new Set(significantTokens(a));
+  const B = significantTokens(b);
+  if (!A.size || !B.length) return 0;
+  const hits = B.filter((x) => A.has(x)).length;
+  return hits / B.length;
+}
+
+function parseTocChapters(pages) {
+  const tocIndex = pages.findIndex((p) => /daftar\s+isi/i.test(String(p || '')));
+  if (tocIndex < 0) return { tocIndex: -1, chapters: [] };
+
+  const chunks = [];
+  for (let i = tocIndex; i < Math.min(pages.length, tocIndex + 8); i++) {
+    chunks.push(String(pages[i] || '').replace(/\u0000/g, ' '));
+  }
+  const tocText = chunks.join('\n');
+  const chapters = [];
+  const re = /\bBab\s+([IVXLC]+|\d+)\s+(.{4,220}?)\s+(\d{1,3})(?=\s|$)/gi;
+  let m;
+  while ((m = re.exec(tocText))) {
+    const number = normalizeChapterNumber(m[1]);
+    if (!number) continue;
+    let title = clean(m[2]);
+    title = title.replace(/(?:\.{2,}|…+)\s*$/g, '').trim();
+    title = title.replace(/^(?:dan|serta)\s+/i, '');
+    const printedPage = Number(m[3]);
+    if (!title || printedPage <= 0) continue;
+    const duplicate = chapters.some((c) => c.number === number && tokenSimilarity(c.title, title) > 0.7);
+    if (!duplicate) chapters.push({ number, roman: m[1].toUpperCase(), title, printedPage });
+  }
+
+  return { tocIndex, chapters: chapters.sort((a, b) => a.number - b.number) };
+}
+
+function findActualChapterPage(pages, tocIndex, tocChapter) {
+  const expected = `${tocChapter.title}`;
+  const targetNumber = tocChapter.number;
+  const candidates = [];
+
+  for (let i = Math.max(tocIndex + 1, 0); i < pages.length; i++) {
+    const text = String(pages[i] || '').trim();
+    if (!text || text.length < 300 || isFrontMatter(text)) continue;
+
+    const lines = text.split('\n').map(clean).filter(Boolean);
+    for (const line of lines.slice(0, 30)) {
+      if (!chapterHeading(line)) continue;
+      const n = normalizeChapterNumber(extractChapterNumber(line));
+      if (n !== targetNumber) continue;
+      const title = chapterTitleFromHeading(line);
+      const sim = tokenSimilarity(title, expected);
+      if (sim < 0.45) continue;
+      const learning = /tujuan pembelajaran|kata kunci|pertanyaan pemantik|aktivitas pembelajaran|kegiatan pembelajaran/i.test(text);
+      const score = sim * 100 + (learning ? 15 : 0) + Math.min(text.length / 1000, 10);
+      candidates.push({ page: i + 1, line, title, similarity: sim, score });
+    }
+  }
+
+  candidates.sort((a, b) => a.page - b.page || b.score - a.score);
+  return candidates[0] || null;
+}
+
+function findFirstSubchapter(pages, chapterPage) {
+  const start = Math.max(0, chapterPage - 1);
+  const end = Math.min(pages.length, start + 25);
+  const excluded = /^(ayo\s+uji|aktivitas|projek|proyek|pengayaan|remedial|refleksi|rangkuman|evaluasi|asesmen|glosarium)/i;
+
+  for (let i = start; i < end; i++) {
+    const lines = pages[i].split('\n').map(clean).filter(Boolean);
+    for (const line of lines) {
+      if (excluded.test(line)) continue;
+      const m = line.match(/^([A-Z])\.?\s+(.{4,140})$/);
+      if (!m) continue;
+      const title = clean(m[2]);
+      if (/^[A-Z]$/i.test(title) || /^\d/.test(title)) continue;
+      if (isFrontMatter(title)) continue;
+      return { label: m[1].toUpperCase(), title, page: i + 1 };
+    }
+  }
+  return null;
 }
 
 function findFirstRealChapter(pages) {
+  const toc = parseTocChapters(pages);
+  if (toc.chapters.length) {
+    const first = toc.chapters[0];
+    const actual = findActualChapterPage(pages, toc.tocIndex, first);
+    if (actual) {
+      const sub = findFirstSubchapter(pages, actual.page);
+      return {
+        page: actual.page,
+        chapter: `Bab ${first.roman} ${first.title}`,
+        score: actual.score,
+        hasLearningSignals: /tujuan pembelajaran|kata kunci|pertanyaan pemantik|aktivitas pembelajaran|kegiatan pembelajaran/i.test(String(pages[actual.page - 1] || '')),
+        nextSubstantive: String(pages[actual.page] || '').length >= 600,
+        source: 'table_of_contents',
+        tocIndex: toc.tocIndex + 1,
+        tocPrintedPage: first.printedPage,
+        subchapter: sub
+      };
+    }
+  }
+
   const candidates = [];
   for (let i = 4; i < Math.min(pages.length, 120); i++) {
     const text = String(pages[i] || '').trim();
     if (!text || isFrontMatter(text)) continue;
-    if (text.toLowerCase().includes('daftar isi')) continue;
     const lines = text.split('\n').map(clean).filter(Boolean);
     const chapter = lines.find(chapterHeading);
     if (!chapter) continue;
@@ -51,9 +169,9 @@ function findFirstRealChapter(pages) {
     const nextSubstantive = next.some((p) => p.length >= 600 && !isFrontMatter(p));
     const learning = /tujuan pembelajaran|kata kunci|pertanyaan pemantik|aktivitas pembelajaran|kegiatan pembelajaran/i.test(text);
     let score = 20 + (i >= 8 ? 5 : 0) + (text.length >= 700 ? 4 : 0) + (nextSubstantive ? 8 : 0) + (learning ? 3 : 0);
-    candidates.push({ page: i + 1, chapter, score, hasLearningSignals: learning, nextSubstantive });
+    candidates.push({ page: i + 1, chapter, score, hasLearningSignals: learning, nextSubstantive, source: 'heuristic_fallback' });
   }
-  return candidates.sort((a, b) => a.page - b.page || b.score - a.score)[0] || { page: 1, chapter: '', score: 0, hasLearningSignals: false, nextSubstantive: false };
+  return candidates.sort((a, b) => a.page - b.page || b.score - a.score)[0] || { page: 1, chapter: '', score: 0, hasLearningSignals: false, nextSubstantive: false, source: 'fallback' };
 }
 
 function findChapterAndSubchapter(pages, startPage) {
@@ -66,11 +184,8 @@ function findChapterAndSubchapter(pages, startPage) {
     const c = lines.find(chapterHeading);
     if (c) { chapter = c; chapterPage = i + 1; break; }
   }
-  const begin = Math.max(0, chapterPage - 1);
-  for (let i = begin; i < Math.min(pages.length, begin + 20); i++) {
-    const s = pages[i].split('\n').map(clean).find(subchapterHeading);
-    if (s) { subchapter = s; subchapterPage = i + 1; break; }
-  }
+  const detected = findFirstSubchapter(pages, chapterPage);
+  if (detected) { subchapter = `${detected.label}. ${detected.title}`; subchapterPage = detected.page; }
   return { bab: chapter || 'Materi berikutnya', subbab: subchapter || 'Subbab berikutnya', chapterPage, subchapterPage };
 }
 
@@ -173,6 +288,9 @@ async function readTask(sql, task) {
     first_content_chapter: firstChapter.chapter || selection.bab,
     content_detection_score: firstChapter.score,
     content_detection_signals: { hasLearningSignals: firstChapter.hasLearningSignals, nextSubstantive: firstChapter.nextSubstantive },
+    content_locator_source: firstChapter.source || 'unknown',
+    toc_index_page: firstChapter.tocIndex || null,
+    toc_printed_page: firstChapter.tocPrintedPage || null,
     preview_halaman: pages.slice(firstChapter.page - 1, firstChapter.page + 2).map((text, i) => ({ halaman: firstChapter.page + i, karakter: text.length, cuplikan: text.slice(0, 700) })),
     bab: selection.bab, subbab: selection.subbab, halaman_bab: selection.chapterPage, halaman_subbab: selection.subchapterPage,
     materi_excerpt: excerpt,
