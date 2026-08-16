@@ -17,31 +17,43 @@ function parseUnit(line){const m=clean(line).match(UNIT_RE);if(!m)return null;re
 function lines(text){return String(text||'').split('\n').map(clean).filter(Boolean);}
 function isNoise(line){const t=norm(line);return !t||/^\d{1,4}$/.test(t)||/^[ivxlcdm]+$/.test(t)||/(kata pengantar|daftar isi|daftar gambar|daftar tabel|prakata|isbn|hak cipta|kementerian pendidikan|kementerian agama)/.test(t);}
 
+function envDiagnostics(){
+  const e=env();
+  const names=['DATABASE_URL','POSTGRES_PRISMA_URL','POSTGRES_URL','POSTGRES_URL_NON_POOLING','POSTGRES_URL_NO_SSL','DATABASE_URL_UNPOOLED','PGHOST','PGPORT','PGUSER','PGPASSWORD','PGDATABASE','NEON_DATABASE_URL','NEON_POSTGRES_URL'];
+  const present={};
+  for(const name of names) present[name]=typeof e[name]==='string' && e[name].trim().length>0;
+  return {
+    present,
+    relevant_keys: Object.keys(e).filter(k=>/^(DATABASE|POSTGRES|PG|NEON)_/i.test(k)).sort(),
+    node_env: e.NODE_ENV || null,
+    vercel_env: e.VERCEL_ENV || null,
+  };
+}
+
 function sqlClient(){
   const e=env();
   const candidates=[
     ['DATABASE_URL',e.DATABASE_URL],
     ['POSTGRES_PRISMA_URL',e.POSTGRES_PRISMA_URL],
     ['POSTGRES_URL',e.POSTGRES_URL],
-    ['DATABASE_URL_UNPOOLED',e.DATABASE_URL_UNPOOLED]
+    ['POSTGRES_URL_NON_POOLING',e.POSTGRES_URL_NON_POOLING],
+    ['POSTGRES_URL_NO_SSL',e.POSTGRES_URL_NO_SSL],
+    ['DATABASE_URL_UNPOOLED',e.DATABASE_URL_UNPOOLED],
   ];
   const found=candidates.find(([,value])=>typeof value==='string'&&value.trim());
-  if(found) return {sql: neon(found[1]), source: found[0]};
+  if(found) return { sql: neon(found[1]), source: found[0], diagnostics: envDiagnostics() };
 
-  // Neon/Vercel can also expose the individual PostgreSQL connection variables.
-  // The project already has these variables, so build a standard TLS connection URL
-  // when the aggregate *_URL variables are not injected into the function runtime.
-  const host=e.PGHOST;
-  const user=e.PGUSER;
-  const password=e.PGPASSWORD;
-  const database=e.PGDATABASE || 'neondb';
-  const port=e.PGPORT || '5432';
-  if(host && user && password){
-    const url=`postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}?sslmode=require`;
-    return {sql: neon(url), source:'PGHOST/PGUSER/PGPASSWORD'};
+  const pgHost = String(e.PGHOST || '').trim();
+  const pgUser = String(e.PGUSER || '').trim();
+  const pgPassword = String(e.PGPASSWORD || '').trim();
+  const pgDatabase = String(e.PGDATABASE || '').trim();
+  const pgPort = String(e.PGPORT || '5432').trim();
+  if(pgHost && pgUser && pgPassword && pgDatabase){
+    const url = `postgresql://${encodeURIComponent(pgUser)}:${encodeURIComponent(pgPassword)}@${pgHost}:${pgPort}/${encodeURIComponent(pgDatabase)}?sslmode=require`;
+    return { sql: neon(url), source:'PGHOST/PGUSER/PGPASSWORD/PGDATABASE', diagnostics: envDiagnostics() };
   }
 
-  throw new Error('Database connection variable tidak tersedia. Pastikan POSTGRES_PRISMA_URL/DATABASE_URL atau PGHOST+PGUSER+PGPASSWORD ada di Environment Variables, lalu buat deployment baru.');
+  throw new Error(`Database connection variable tidak tersedia. ${JSON.stringify(envDiagnostics())}`);
 }
 
 async function resolveBlob(sql,book,mapel,kelas){
@@ -81,4 +93,4 @@ async function process(sql,task){
   return{task_id:task.task_id,status:'success',context_valid:context.length>200&&selected.length>0&&contamination===0,blob_path:blob.pathname,mapel:task.mapel,kelas,buku:book.nama_buku,bab:unitName,subbab:`${sub.label}. ${sub.title}`,halaman_awal:selected[0]?.page||start,halaman_akhir:selected.at(-1)?.page||end,total_context_characters:context.length,contamination_pages:contamination,pages:selected.map(x=>x.page),context};
 }
 
-export async function POST(request){try{const body=await request.json().catch(()=>({}));const {sql,source}=sqlClient();const taskId=body.task_id?String(body.task_id):null;const tanggal=body.tanggal?String(body.tanggal):null;if(!taskId&&!tanggal)return Response.json({agent:'context_extractor',status:'error',reason:'Kirim task_id atau tanggal.'},{status:400});const tasks=taskId?await sql`SELECT * FROM tasks WHERE task_id=${taskId} LIMIT 1`:await sql`SELECT * FROM tasks WHERE tanggal=${tanggal} AND status IN ('book_ready','progress_ready','book_error') ORDER BY task_id`;if(!tasks.length)return Response.json({agent:'context_extractor',status:'no_tasks',tanggal,tasks:[]});const results=[];for(const task of tasks){try{results.push(await process(sql,task));}catch(e){results.push({task_id:task.task_id,status:'error',error:e instanceof Error?e.message:'Context Extractor gagal.'});}}return Response.json({agent:'context_extractor',status:'success',tanggal:tanggal||tasks[0]?.tanggal,database_source:source,tasks:results});}catch(e){return Response.json({agent:'context_extractor',status:'error',reason:e instanceof Error?e.message:'Context Extractor gagal.'},{status:500});}}
+export async function POST(request){try{const body=await request.json().catch(()=>({}));const db=sqlClient();const sql=db.sql;const taskId=body.task_id?String(body.task_id):null;const tanggal=body.tanggal?String(body.tanggal):null;if(!taskId&&!tanggal)return Response.json({agent:'context_extractor',status:'error',reason:'Kirim task_id atau tanggal.'},{status:400});const tasks=taskId?await sql`SELECT * FROM tasks WHERE task_id=${taskId} LIMIT 1`:await sql`SELECT * FROM tasks WHERE tanggal=${tanggal} AND status IN ('book_ready','progress_ready','book_error') ORDER BY task_id`;if(!tasks.length)return Response.json({agent:'context_extractor',status:'no_tasks',tanggal,tasks:[]});const results=[];for(const task of tasks){try{results.push(await process(sql,task));}catch(e){results.push({task_id:task.task_id,status:'error',error:e instanceof Error?e.message:'Context Extractor gagal.'});}}return Response.json({agent:'context_extractor',status:'success',tanggal:tanggal||tasks[0]?.tanggal,database_source:db.source,tasks:results});}catch(e){console.error('Context Extractor error:',e);return Response.json({agent:'context_extractor',status:'error',reason:e instanceof Error?e.message:'Context Extractor gagal.'},{status:500});}}
