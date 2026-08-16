@@ -43,11 +43,29 @@ export async function POST(request) {
         `;
 
     if (!tasks.length) {
+      const diagnostics = tanggal
+        ? await sql`
+            SELECT
+              (SELECT COUNT(*)::int FROM tasks) AS total_tasks,
+              (SELECT COUNT(*)::int FROM tasks WHERE tanggal = ${tanggal}) AS matching_date_tasks,
+              (SELECT COUNT(*)::int FROM tasks WHERE tanggal = ${tanggal} AND status = 'pending') AS pending_date_tasks,
+              (SELECT COUNT(*)::int FROM progress) AS progress_rows
+          `
+        : await sql`
+            SELECT
+              (SELECT COUNT(*)::int FROM tasks) AS total_tasks,
+              0::int AS matching_date_tasks,
+              0::int AS pending_date_tasks,
+              (SELECT COUNT(*)::int FROM progress) AS progress_rows
+          `;
+
       return json({
         agent: 'progress_manager',
         status: 'no_tasks',
         tanggal,
-        tasks: []
+        tasks: [],
+        diagnostics: diagnostics[0],
+        reason: 'Tidak ada task pending untuk tanggal tersebut. Jalankan Scheduler untuk tanggal yang sama terlebih dahulu.'
       });
     }
 
@@ -78,24 +96,13 @@ export async function POST(request) {
 
       const kelas = task.kelas || '-';
 
-      let previous = [];
-      if (task.jenis_kegiatan === 'Ekstrakurikuler') {
-        previous = await sql`
-          SELECT * FROM progress
-          WHERE sekolah = ${task.sekolah}
-            AND mapel = ${task.mapel}
-            AND kelas = '-'
-          LIMIT 1
-        `;
-      } else {
-        previous = await sql`
-          SELECT * FROM progress
-          WHERE sekolah = ${task.sekolah}
-            AND mapel = ${task.mapel}
-            AND kelas = ${kelas}
-          LIMIT 1
-        `;
-      }
+      const previous = await sql`
+        SELECT * FROM progress
+        WHERE sekolah = ${task.sekolah}
+          AND mapel = ${task.mapel}
+          AND kelas = ${task.jenis_kegiatan === 'Ekstrakurikuler' ? '-' : kelas}
+        LIMIT 1
+      `;
 
       const row = previous[0] || null;
       const nextMeeting = row ? Number(row.pertemuan_terakhir || 0) + 1 : 1;
