@@ -18,13 +18,13 @@ export async function POST(request) {
       tahun = null,
       file_name,
       blob_path,
-      blob_url,
+      blob_url = '',
       file_size = 0,
       mime_type = 'application/pdf',
     } = body;
 
-    if (!nama_buku || !mapel || !kelas || !file_name || !blob_path || !blob_url) {
-      return Response.json({ error: 'Metadata buku dan informasi blob wajib diisi.' }, { status: 400 });
+    if (!nama_buku || !mapel || !kelas || !file_name || !blob_path) {
+      return Response.json({ error: 'Metadata buku dan blob_path wajib diisi.' }, { status: 400 });
     }
 
     const sql = getSql();
@@ -39,7 +39,7 @@ export async function POST(request) {
         tahun INTEGER,
         file_name TEXT NOT NULL,
         blob_path TEXT NOT NULL,
-        blob_url TEXT NOT NULL,
+        blob_url TEXT NOT NULL DEFAULT '',
         file_size BIGINT DEFAULT 0,
         mime_type TEXT DEFAULT 'application/pdf',
         aktif BOOLEAN NOT NULL DEFAULT TRUE,
@@ -54,7 +54,7 @@ export async function POST(request) {
         file_name, blob_path, blob_url, file_size, mime_type
       ) VALUES (
         ${nama_buku}, ${mapel}, ${kelas}, ${penerbit}, ${tahun ? Number(tahun) : null},
-        ${file_name}, ${blob_path}, ${blob_url}, ${Number(file_size) || 0}, ${mime_type}
+        ${file_name}, ${blob_path}, ${blob_url || ''}, ${Number(file_size) || 0}, ${mime_type}
       )
       RETURNING id, nama_buku, mapel, kelas, penerbit, tahun, file_name, blob_path, blob_url, file_size, created_at
     `;
