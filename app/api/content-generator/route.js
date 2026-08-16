@@ -8,9 +8,7 @@ function cleanDate(value) {
   if (m) return `${m[1]}-${m[2]}-${m[3]}`;
   const d = new Date(value);
   if (!Number.isNaN(d.getTime())) {
-    const y = d.getFullYear();
-    const mo = String(d.getMonth() + 1).padStart(2, '0');
-    const da = String(d.getDate()).padStart(2, '0');
+    const y = d.getUTCFullYear(); const mo = String(d.getUTCMonth() + 1).padStart(2, '0'); const da = String(d.getUTCDate()).padStart(2, '0');
     return `${y}-${mo}-${da}`;
   }
   return s || new Date().toISOString().slice(0, 10);
@@ -25,11 +23,9 @@ export async function POST(request) {
     const tanggal = cleanDate(body?.tanggal || new Date().toISOString().slice(0, 10));
     const qs = new URLSearchParams({ tanggal });
     if (body?.task_id) qs.set('task_id', String(body.task_id));
-    const response = await fetch(`${origin}/api/content-generator-v2?${qs.toString()}&run=${Date.now()}`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' },
-      body: JSON.stringify({ tanggal, task_id: body?.task_id || null }),
-      cache: 'no-store',
+    const response = await fetch(`${origin}/api/content-generator-v3?${qs.toString()}&run=${Date.now()}`, {
+      method: 'POST', headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' },
+      body: JSON.stringify({ tanggal, task_id: body?.task_id || null }), cache: 'no-store'
     });
     const data = await response.json();
     return Response.json(data, { status: response.status });
