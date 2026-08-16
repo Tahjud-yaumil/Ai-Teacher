@@ -1,5 +1,5 @@
 import { neon } from '@neondatabase/serverless';
-import { get } from '@vercel/blob';
+import { issueSignedToken, presignUrl } from '@vercel/blob';
 import pdfParse from 'pdf-parse';
 
 export const runtime = 'nodejs';
@@ -86,51 +86,45 @@ function buildExcerpt(pageTexts, pageStart, pageEnd) {
 }
 
 async function loadPrivatePdf(book) {
-  const pathname = book.blob_path;
-  const url = book.blob_url;
+  const pathname = String(book.blob_path || '').trim();
   const storeId = process.env.BLOB_STORE_ID;
   const oidcToken = process.env.VERCEL_OIDC_TOKEN;
 
-  const attempts = [];
-  if (url) attempts.push({ label: 'blob_url', target: url });
-  if (pathname) attempts.push({ label: 'blob_path', target: pathname });
+  if (!pathname) throw new Error(`blob_path kosong untuk ${book.file_name}.`);
+  if (!storeId) throw new Error('BLOB_STORE_ID belum tersedia di environment Vercel.');
 
-  let lastError = null;
+  let signed;
+  try {
+    const delegation = await issueSignedToken({
+      pathname,
+      operations: ['get'],
+      validUntil: Date.now() + 10 * 60 * 1000,
+      ...(oidcToken ? { oidcToken } : {}),
+      storeId,
+    });
 
-  for (const attempt of attempts) {
-    try {
-      const options = {
-        access: 'private',
-        useCache: false,
-        ...(storeId ? { storeId } : {}),
-        ...(oidcToken ? { oidcToken } : {}),
-      };
-
-      const result = await get(attempt.target, options);
-
-      if (!result) {
-        lastError = new Error(`${attempt.label}: blob tidak ditemukan`);
-        continue;
-      }
-
-      if (result.statusCode && result.statusCode !== 200) {
-        lastError = new Error(`${attempt.label}: Blob HTTP ${result.statusCode}`);
-        continue;
-      }
-
-      if (!result.stream) {
-        lastError = new Error(`${attempt.label}: response tidak memiliki stream`);
-        continue;
-      }
-
-      return { result, source: attempt.label };
-    } catch (error) {
-      lastError = error;
-    }
+    signed = await presignUrl(delegation, {
+      operation: 'get',
+      pathname,
+      access: 'private',
+      validUntil: Date.now() + 5 * 60 * 1000,
+      useCache: false,
+    });
+  } catch (error) {
+    throw new Error(`Gagal membuat signed URL untuk ${book.file_name}: ${error instanceof Error ? error.message : String(error)}`);
   }
 
-  const detail = lastError instanceof Error ? lastError.message : 'unknown fetch error';
-  throw new Error(`PDF tidak dapat diambil dari Private Blob (${detail}).`);
+  const response = await fetch(signed.presignedUrl, {
+    method: 'GET',
+    cache: 'no-store',
+  });
+
+  if (!response.ok) {
+    throw new Error(`Blob GET HTTP ${response.status} untuk ${book.file_name}.`);
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  return Buffer.from(arrayBuffer);
 }
 
 async function readTask(sql, task) {
@@ -148,10 +142,19 @@ async function readTask(sql, task) {
 
   if (!books.length) {
     await sql`
-      UPDATE tasks SET status = 'book_missing', book_path = '', error_message = ${`Buku ${task.mapel} kelas ${klasse} belum tersedia.`}, updated_at = NOW()
+      UPDATE tasks
+      SET status = 'book_missing', book_path = '',
+          error_message = ${`Buku ${task.mapel} kelas ${klasse} belum tersedia.`},
+          updated_at = NOW()
       WHERE task_id = ${task.task_id}
     `;
-    return { task_id: task.task_id, status: 'book_missing', mapel: task.mapel, kelas: klasse, reason: `Tidak ada buku untuk ${task.mapel} ${klasse}.` };
+    return {
+      task_id: task.task_id,
+      status: 'book_missing',
+      mapel: task.mapel,
+      kelas: klasse,
+      reason: `Tidak ada buku untuk ${task.mapel} ${klasse}.`,
+    };
   }
 
   const book = books[0];
@@ -164,10 +167,7 @@ async function readTask(sql, task) {
   const previousEndPage = Number(progress?.halaman_akhir || 0);
   const startPage = previousEndPage > 0 ? previousEndPage + 1 : 1;
 
-  const { result, source } = await loadPrivatePdf(book);
-  const arrayBuffer = await new Response(result.stream).arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-
+  const buffer = await loadPrivatePdf(book);
   if (buffer.length < 5) throw new Error(`PDF kosong: ${book.file_name}`);
   if (buffer.subarray(0, 5).toString() !== '%PDF-') throw new Error(`Objek Blob bukan PDF valid: ${book.file_name}`);
 
@@ -186,14 +186,13 @@ async function readTask(sql, task) {
 
   await sql`
     UPDATE tasks
-    SET status = 'book_ready', book_path = ${book.blob_path}, updated_at = NOW(), error_message = ''
+    SET status = 'book_ready', book_path = ${book.blob_path}, error_message = '', updated_at = NOW()
     WHERE task_id = ${task.task_id}
   `;
 
   return {
     task_id: task.task_id,
     status: 'success',
-    source,
     sekolah: task.sekolah,
     mapel: task.mapel,
     kelas: klasse,
