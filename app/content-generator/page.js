@@ -11,7 +11,7 @@ export default function ContentGeneratorPage() {
     setLoading(true);
     setResult(null);
     try {
-      const r = await fetch(`/api/content-generator?run=${Date.now()}`, {
+      const r = await fetch(`/api/content-generator-v4?run=${Date.now()}`, {
         method: 'POST',
         cache: 'no-store',
         headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' },
