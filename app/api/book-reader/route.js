@@ -14,17 +14,128 @@ function cleanLine(line) {
   return String(line || '').replace(/\s+/g, ' ').trim();
 }
 
-function looksLikeHeading(line) {
-  const value = cleanLine(line);
-  if (value.length < 4 || value.length > 120) return false;
-  if (/^BAB\s+[IVXLC0-9]+\b/i.test(value)) return true;
-  if (/^BAB\s+\S+/i.test(value)) return true;
-  if (/^[A-Z]\s*\.\s+\S+/.test(value)) return true;
-  if (/^\d+(?:\.\d+)*\s+\S+/.test(value)) return true;
+function isFrontMatter(pageText) {
+  const text = pageText.toLowerCase();
+  const markers = [
+    'kata pengantar',
+    'daftar isi',
+    'petunjuk penggunaan buku',
+    'petunjuk penggunaan',
+    'glosarium',
+    'indeks',
+    'biodata penulis',
+    'profil penulis',
+    'hak cipta',
+    'isbn',
+    'dilindungi undang-undang',
+    'kementerian pendidikan',
+    'kementerian agama',
+    'diterbitkan oleh',
+  ];
 
-  const letters = value.replace(/[^A-Za-zÀ-ÿ]/g, '');
-  const upper = letters.replace(/[^A-ZÀ-Ý]/g, '');
-  return letters.length >= 8 && upper.length / letters.length > 0.88;
+  return markers.filter((marker) => text.includes(marker)).length >= 1;
+}
+
+function looksLikeChapterHeading(line) {
+  const value = cleanLine(line);
+  if (value.length < 5 || value.length > 140) return false;
+  return /^BAB\s+(?:[IVXLC]+|\d+)\b/i.test(value) || /^BAB\s+\S+/i.test(value);
+}
+
+function looksLikeSubchapter(line) {
+  const value = cleanLine(line);
+  if (value.length < 5 || value.length > 140) return false;
+  if (/^(?:KEMENTERIAN|ISBN|HAK CIPTA|KATA PENGANTAR|DAFTAR ISI)$/i.test(value)) return false;
+  if (/^BAB\s+/i.test(value)) return false;
+  if (/^\d+(?:\.\d+)+\s+\S+/.test(value)) return true;
+  if (/^[A-Z]\s*\.\s+\S+/.test(value)) return true;
+  return /^[A-Z][A-Z0-9 &,:()'-]{8,}$/.test(value) && !isFrontMatter(value);
+}
+
+function looksLikeHeading(line) {
+  return looksLikeChapterHeading(line) || looksLikeSubchapter(line);
+}
+
+function findFirstContentPage(pageTexts) {
+  const scanLimit = Math.min(pageTexts.length, 80);
+  let best = null;
+
+  for (let pageIndex = 0; pageIndex < scanLimit; pageIndex += 1) {
+    const text = String(pageTexts[pageIndex] || '').trim();
+    if (!text) continue;
+
+    const lines = text.split('\n').map(cleanLine).filter(Boolean);
+    const chapter = lines.find(looksLikeChapterHeading);
+    const lower = text.toLowerCase();
+    const hasLearningSignals = [
+      'tujuan pembelajaran',
+      'kata kunci',
+      'pertanyaan pemantik',
+      'aktivitas pembelajaran',
+      'kegiatan pembelajaran',
+    ].some((signal) => lower.includes(signal));
+
+    const hasSubheading = lines.some(looksLikeSubchapter);
+    const substantive = text.length >= 700;
+    const frontMatter = isFrontMatter(text);
+
+    let score = 0;
+    if (chapter) score += 12;
+    if (hasLearningSignals) score += 5;
+    if (hasSubheading) score += 2;
+    if (substantive) score += 2;
+    if (frontMatter) score -= 8;
+
+    // A real first chapter is normally after the front matter and is much more
+    // substantive than a title/metadata page.
+    if (pageIndex < 2 && !chapter) score -= 3;
+
+    if (score >= 10 && (!best || score > best.score)) {
+      best = {
+        page: pageIndex + 1,
+        score,
+        chapter: chapter || '',
+        signals: {
+          hasLearningSignals,
+          hasSubheading,
+          substantive,
+          frontMatter,
+        },
+      };
+    }
+  }
+
+  if (best) return best;
+
+  // Conservative fallback: first non-empty substantive page.
+  for (let pageIndex = 0; pageIndex < scanLimit; pageIndex += 1) {
+    const text = String(pageTexts[pageIndex] || '').trim();
+    if (text.length >= 900 && !isFrontMatter(text)) {
+      return {
+        page: pageIndex + 1,
+        score: 4,
+        chapter: '',
+        signals: {
+          hasLearningSignals: false,
+          hasSubheading: false,
+          substantive: true,
+          frontMatter: false,
+        },
+      };
+    }
+  }
+
+  return {
+    page: 1,
+    score: 0,
+    chapter: '',
+    signals: {
+      hasLearningSignals: false,
+      hasSubheading: false,
+      substantive: false,
+      frontMatter: false,
+    },
+  };
 }
 
 function findChapterAndSubchapter(pageTexts, startPage) {
@@ -37,7 +148,7 @@ function findChapterAndSubchapter(pageTexts, startPage) {
   for (let i = Math.max(0, startPage - 1); i < pageTexts.length; i += 1) {
     const lines = pageTexts[i].split('\n').map(cleanLine).filter(Boolean);
     for (const line of lines) {
-      if (/^BAB\s+/i.test(line)) {
+      if (looksLikeChapterHeading(line)) {
         chapterIndex = i;
         chapter = line;
         chapterPage = i + 1;
@@ -48,12 +159,10 @@ function findChapterAndSubchapter(pageTexts, startPage) {
   }
 
   const searchFrom = chapterIndex >= 0 ? chapterIndex : Math.max(0, startPage - 1);
-  for (let i = searchFrom; i < Math.min(pageTexts.length, searchFrom + 12); i += 1) {
+  for (let i = searchFrom; i < Math.min(pageTexts.length, searchFrom + 20); i += 1) {
     const lines = pageTexts[i].split('\n').map(cleanLine).filter(Boolean);
     for (const line of lines) {
-      if (!looksLikeHeading(line)) continue;
-      if (/^BAB\s+/i.test(line) && chapterIndex < 0) continue;
-      if (chapter && line === chapter) continue;
+      if (!looksLikeSubchapter(line)) continue;
       subchapter = line;
       subchapterPage = i + 1;
       break;
@@ -62,18 +171,29 @@ function findChapterAndSubchapter(pageTexts, startPage) {
   }
 
   if (!chapter) {
-    const fallback = pageTexts[Math.max(0, startPage - 1)]?.split('\n').map(cleanLine).find(looksLikeHeading);
+    const fallback = pageTexts[Math.max(0, startPage - 1)]
+      ?.split('\n')
+      .map(cleanLine)
+      .find(looksLikeHeading);
     chapter = fallback || 'Materi berikutnya';
     chapterPage = Math.max(1, startPage);
   }
 
   if (!subchapter) {
-    const fallback = pageTexts[Math.max(0, startPage - 1)]?.split('\n').map(cleanLine).find((line) => looksLikeHeading(line) && line !== chapter);
+    const fallback = pageTexts[Math.max(0, startPage - 1)]
+      ?.split('\n')
+      .map(cleanLine)
+      .find((line) => looksLikeSubchapter(line) && line !== chapter);
     subchapter = fallback || 'Subbab berikutnya';
     subchapterPage = Math.max(1, startPage);
   }
 
-  return { bab: chapter, subbab: subchapter, chapterPage, subchapterPage };
+  return {
+    bab: chapter,
+    subbab: subchapter,
+    chapterPage,
+    subchapterPage,
+  };
 }
 
 function buildExcerpt(pageTexts, pageStart, pageEnd) {
@@ -222,16 +342,11 @@ async function extractPdfPages(buffer) {
   };
 
   const parsed = await pdfParse(buffer, { pagerender });
-
-  // pagerender is called once per page. Sort order is preserved for normal PDF parsing.
   const pages = pageTexts.map((text) => String(text || '').trim());
   const totalPages = Number(parsed.numpages) || pages.length;
 
-  if (!totalPages) {
-    throw new Error('PDF tidak memiliki halaman yang terbaca.');
-  }
+  if (!totalPages) throw new Error('PDF tidak memiliki halaman yang terbaca.');
 
-  // 6A diagnostic: do not fake page count from form-feed characters.
   return {
     pages,
     totalPages,
@@ -266,6 +381,7 @@ async function readTask(sql, task) {
 
   const book = books[0];
   const actual = await findActualBlob(sql, book, task.mapel, klasse);
+
   const previous = await sql`
     SELECT * FROM progress
     WHERE sekolah = ${task.sekolah} AND mapel = ${task.mapel} AND kelas = ${klasse}
@@ -273,7 +389,6 @@ async function readTask(sql, task) {
   `;
   const progress = previous[0] || null;
   const previousEndPage = Number(progress?.halaman_akhir || 0);
-  const startPage = previousEndPage > 0 ? previousEndPage + 1 : 1;
 
   const buffer = await loadPrivatePdf(actual.pathname);
   if (buffer.length < 5) throw new Error(`PDF kosong: ${book.file_name}`);
@@ -282,6 +397,8 @@ async function readTask(sql, task) {
   const extracted = await extractPdfPages(buffer);
   const { pages: pageTexts, totalPages, extractionMethod, totalTextCharacters } = extracted;
 
+  const firstContent = findFirstContentPage(pageTexts);
+  const startPage = previousEndPage > 0 ? previousEndPage + 1 : firstContent.page;
   const safeStart = Math.min(Math.max(1, startPage), totalPages);
   const safeEnd = Math.min(totalPages, safeStart + 3);
   const selection = findChapterAndSubchapter(pageTexts, safeStart);
@@ -312,8 +429,13 @@ async function readTask(sql, task) {
     total_text_characters: totalTextCharacters,
     halaman_awal: safeStart,
     halaman_akhir: safeEnd,
-    preview_halaman: pageTexts.slice(0, 3).map((text, index) => ({
-      halaman: index + 1,
+    first_content_page: firstContent.page,
+    front_matter_pages: Math.max(0, firstContent.page - 1),
+    first_content_chapter: firstContent.chapter,
+    content_detection_score: firstContent.score,
+    content_detection_signals: firstContent.signals,
+    preview_halaman: pageTexts.slice(Math.max(0, safeStart - 1), Math.min(pageTexts.length, safeStart + 2)).map((text, index) => ({
+      halaman: safeStart + index,
       karakter: text.length,
       cuplikan: text.slice(0, 500),
     })),
