@@ -26,8 +26,22 @@ function sqlClient(){
     ['DATABASE_URL_UNPOOLED',e.DATABASE_URL_UNPOOLED]
   ];
   const found=candidates.find(([,value])=>typeof value==='string'&&value.trim());
-  if(!found) throw new Error('Database connection variable tidak tersedia. Pastikan POSTGRES_PRISMA_URL atau DATABASE_URL ada di Environment Variables, lalu buat deployment baru.');
-  return { sql: neon(found[1]), source: found[0] };
+  if(found) return {sql: neon(found[1]), source: found[0]};
+
+  // Neon/Vercel can also expose the individual PostgreSQL connection variables.
+  // The project already has these variables, so build a standard TLS connection URL
+  // when the aggregate *_URL variables are not injected into the function runtime.
+  const host=e.PGHOST;
+  const user=e.PGUSER;
+  const password=e.PGPASSWORD;
+  const database=e.PGDATABASE || 'neondb';
+  const port=e.PGPORT || '5432';
+  if(host && user && password){
+    const url=`postgresql://${encodeURIComponent(user)}:${encodeURIComponent(password)}@${host}:${port}/${encodeURIComponent(database)}?sslmode=require`;
+    return {sql: neon(url), source:'PGHOST/PGUSER/PGPASSWORD'};
+  }
+
+  throw new Error('Database connection variable tidak tersedia. Pastikan POSTGRES_PRISMA_URL/DATABASE_URL atau PGHOST+PGUSER+PGPASSWORD ada di Environment Variables, lalu buat deployment baru.');
 }
 
 async function resolveBlob(sql,book,mapel,kelas){
