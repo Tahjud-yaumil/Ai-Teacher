@@ -9,12 +9,13 @@ const DAY_NAMES = ['Minggu','Senin','Selasa','Rabu','Kamis','Jumat','Sabtu'];
 
 function jakartaNow() {
   const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit', weekday: 'long'
+    timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit'
   }).formatToParts(new Date());
   const values = Object.fromEntries(parts.map(p => [p.type, p.value]));
+  const date = new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day)));
   return {
     tanggal: `${values.year}-${values.month}-${values.day}`,
-    hari: DAY_NAMES[new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day))).getUTCDay()]
+    hari: DAY_NAMES[date.getUTCDay()]
   };
 }
 
@@ -36,7 +37,7 @@ async function sendMessage(chatId, text) {
   });
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d?.ok !== true) throw new Error(`Telegram sendMessage gagal: ${d?.description || `HTTP ${r.status}`}`);
-  return d;
+  return d.result;
 }
 
 export async function POST(request) {
@@ -49,14 +50,15 @@ export async function POST(request) {
 
     const allowedChatId = env('TELEGRAM_CHAT_ID');
     if (allowedChatId && String(chatId) !== String(allowedChatId)) {
-      return Response.json({ ok: true, ignored: true, reason: 'Chat ID tidak diizinkan.' });
+      return Response.json({ ok: true, ignored: true });
     }
 
     const command = text.split(/\s+/)[0].toLowerCase().split('@')[0];
     if (command !== '/jadwal') return Response.json({ ok: true, ignored: true });
 
-    if (!env('DATABASE_URL')) throw new Error('DATABASE_URL belum tersedia.');
-    const sql = neon(env('DATABASE_URL'));
+    const databaseUrl = env('DATABASE_URL');
+    if (!databaseUrl) throw new Error('DATABASE_URL belum tersedia.');
+    const sql = neon(databaseUrl);
     const { tanggal, hari } = jakartaNow();
     const rows = await sql`
       SELECT sekolah, jam_mulai, jam_selesai, mapel, kelas, jenis_kegiatan, catatan
@@ -81,9 +83,9 @@ export async function POST(request) {
           lines.push(`🏫 ${row.sekolah}`);
           lastSchool = row.sekolah;
         }
-        const jamMulai = formatTime(row.jam_mulai);
-        const jamSelesai = formatTime(row.jam_selesai);
-        const jam = jamMulai === '-' && jamSelesai === '-' ? '-' : `${jamMulai}-${jamSelesai}`;
+        const start = formatTime(row.jam_mulai);
+        const end = formatTime(row.jam_selesai);
+        const jam = start === '-' && end === '-' ? '-' : `${start}-${end}`;
         const isPiket = String(row.mapel || '').toLowerCase() === 'guru piket';
         const isEks = String(row.jenis_kegiatan || '').toLowerCase().includes('ekstrakurikuler');
         const icon = isPiket ? '📋' : isEks ? '🎨' : '📚';
