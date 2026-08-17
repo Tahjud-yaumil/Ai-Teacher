@@ -1,0 +1,3 @@
+import { NextResponse } from 'next/server';
+export const runtime='nodejs'; export const dynamic='force-dynamic'; export const maxDuration=180;
+export async function POST(req){try{const body=await req.json().catch(()=>({}));const r=await fetch(new URL('/api/publisher-v1',req.url).toString(),{method:'POST',headers:{'content-type':'application/json','cache-control':'no-cache'},body:JSON.stringify(body),cache:'no-store'});const data=await r.json().catch(()=>({agent:'publisher',status:'error',reason:'Respons publisher bukan JSON.'}));return NextResponse.json(data,{status:r.status});}catch(e){return NextResponse.json({agent:'publisher',status:'error',reason:e instanceof Error?e.message:'Publisher gagal.'},{status:500});}}
