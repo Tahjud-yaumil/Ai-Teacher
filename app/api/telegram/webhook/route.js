@@ -1,7 +1,8 @@
 import { neon } from '@neondatabase/serverless';
+import { after } from 'next/server';
 
 export const runtime = 'nodejs';
-export const maxDuration = 30;
+export const maxDuration = 300;
 export const dynamic = 'force-dynamic';
 
 const env = (n) => typeof process.env[n] === 'string' ? process.env[n].trim() : '';
@@ -13,10 +14,7 @@ function jakartaNow() {
   }).formatToParts(new Date());
   const values = Object.fromEntries(parts.map(p => [p.type, p.value]));
   const date = new Date(Date.UTC(Number(values.year), Number(values.month) - 1, Number(values.day)));
-  return {
-    tanggal: `${values.year}-${values.month}-${values.day}`,
-    hari: DAY_NAMES[date.getUTCDay()]
-  };
+  return { tanggal: `${values.year}-${values.month}-${values.day}`, hari: DAY_NAMES[date.getUTCDay()] };
 }
 
 function formatTime(v) {
@@ -30,14 +28,50 @@ async function sendMessage(chatId, text) {
   const token = env('TELEGRAM_BOT_TOKEN');
   if (!token) throw new Error('TELEGRAM_BOT_TOKEN belum tersedia.');
   const r = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ chat_id: chatId, text }),
-    cache: 'no-store'
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ chat_id: chatId, text }), cache: 'no-store'
   });
   const d = await r.json().catch(() => ({}));
   if (!r.ok || d?.ok !== true) throw new Error(`Telegram sendMessage gagal: ${d?.description || `HTTP ${r.status}`}`);
   return d.result;
+}
+
+function originFrom(request) {
+  const host = request.headers.get('host');
+  const proto = request.headers.get('x-forwarded-proto') || 'https';
+  return host ? `${proto}://${host}` : `https://${env('VERCEL_URL')}`;
+}
+
+async function runDailyPipeline(origin, tanggal) {
+  const secret = env('CRON_SECRET');
+  const headers = { 'content-type': 'application/json', 'cache-control': 'no-cache' };
+  if (secret) headers.authorization = `Bearer ${secret}`;
+  const response = await fetch(`${origin}/api/cron/daily-pipeline?manual=${Date.now()}`, {
+    method: 'GET', headers, cache: 'no-store'
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data?.reason || `Daily pipeline HTTP ${response.status}`);
+  return data;
+}
+
+async function resendStoredRun(sql, origin, chatId, tanggal, run) {
+  const documents = Array.isArray(run.documents) ? run.documents : [];
+  const tasks = Array.isArray(run.tasks) ? run.tasks : [];
+  if (!documents.length) {
+    await sendMessage(chatId, `📋 Hasil ${tanggal} tercatat sudah generate, tetapi tidak ada dokumen tersimpan untuk dikirim ulang.`);
+    return;
+  }
+
+  await sendMessage(chatId, `📤 Hasil ${tanggal} sudah pernah digenerate.\nTidak membuat konten baru.\nMengirim ulang ${documents.length} dokumen...`);
+
+  const response = await fetch(`${origin}/api/publisher?manual_resend=${Date.now()}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'cache-control': 'no-cache' },
+    body: JSON.stringify({ tanggal, documents, tasks }),
+    cache: 'no-store'
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data?.status !== 'success') throw new Error(data?.reason || `Publisher HTTP ${response.status}`);
 }
 
 export async function POST(request) {
@@ -49,11 +83,61 @@ export async function POST(request) {
     if (!chatId) return Response.json({ ok: true, ignored: true });
 
     const allowedChatId = env('TELEGRAM_CHAT_ID');
-    if (allowedChatId && String(chatId) !== String(allowedChatId)) {
-      return Response.json({ ok: true, ignored: true });
-    }
+    if (allowedChatId && String(chatId) !== String(allowedChatId)) return Response.json({ ok: true, ignored: true });
 
     const command = text.split(/\s+/)[0].toLowerCase().split('@')[0];
+
+    if (command === '/generate_manual' || command === 'generate_manual') {
+      const databaseUrl = env('DATABASE_URL');
+      if (!databaseUrl) throw new Error('DATABASE_URL belum tersedia.');
+      const sql = neon(databaseUrl);
+      const { tanggal } = jakartaNow();
+      await sql`
+        CREATE TABLE IF NOT EXISTS pipeline_runs (
+          tanggal DATE PRIMARY KEY,
+          status TEXT NOT NULL,
+          tasks JSONB,
+          documents JSONB,
+          publisher JSONB,
+          reason TEXT,
+          updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+      `;
+
+      const existing = await sql`
+        SELECT status, tasks, documents, publisher, reason
+        FROM pipeline_runs
+        WHERE tanggal = ${tanggal}
+        LIMIT 1
+      `;
+      const run = existing[0];
+      const origin = originFrom(request);
+
+      if (run?.status === 'success') {
+        after(async () => {
+          try {
+            await resendStoredRun(sql, origin, chatId, tanggal, run);
+          } catch (error) {
+            console.error('Manual resend error:', error);
+            try { await sendMessage(chatId, `❌ Gagal mengirim ulang hasil ${tanggal}: ${error instanceof Error ? error.message : 'error'}`); } catch {}
+          }
+        });
+        return Response.json({ ok: true, command: '/generate_manual', tanggal, action: 'resend_existing' });
+      }
+
+      await sendMessage(chatId, `🔄 Generate manual dimulai.\n📅 ${tanggal}\nBelum ada hasil sukses hari ini. Pipeline dijalankan sekarang...`);
+      after(async () => {
+        try {
+          const result = await runDailyPipeline(origin, tanggal);
+          if (result?.status !== 'success') throw new Error(result?.reason || 'Pipeline gagal.');
+        } catch (error) {
+          console.error('Manual pipeline error:', error);
+          try { await sendMessage(chatId, `❌ Generate manual ${tanggal} gagal:\n${error instanceof Error ? error.message : 'error'}`); } catch {}
+        }
+      });
+      return Response.json({ ok: true, command: '/generate_manual', tanggal, action: 'generate' });
+    }
+
     if (command !== '/jadwal') return Response.json({ ok: true, ignored: true });
 
     const databaseUrl = env('DATABASE_URL');
@@ -67,12 +151,7 @@ export async function POST(request) {
       ORDER BY jam_mulai ASC NULLS LAST, id ASC
     `;
 
-    const lines = [
-      '📅 YAUMITEACH — JADWAL HARI INI',
-      `${hari}, ${tanggal.split('-').reverse().join('/')}`,
-      ''
-    ];
-
+    const lines = ['📅 YAUMITEACH — JADWAL HARI INI', `${hari}, ${tanggal.split('-').reverse().join('/')}`, ''];
     if (!rows.length) {
       lines.push('Tidak ada jadwal mengajar hari ini.');
     } else {
@@ -83,8 +162,7 @@ export async function POST(request) {
           lines.push(`🏫 ${row.sekolah}`);
           lastSchool = row.sekolah;
         }
-        const start = formatTime(row.jam_mulai);
-        const end = formatTime(row.jam_selesai);
+        const start = formatTime(row.jam_mulai), end = formatTime(row.jam_selesai);
         const jam = start === '-' && end === '-' ? '-' : `${start}-${end}`;
         const isPiket = String(row.mapel || '').toLowerCase() === 'guru piket';
         const isEks = String(row.jenis_kegiatan || '').toLowerCase().includes('ekstrakurikuler');
