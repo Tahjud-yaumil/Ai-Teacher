@@ -18,9 +18,9 @@ export async function GET(request) {
   const date=jakartaDate(); const origin=new URL(request.url).origin; const startedAt=Date.now(); const steps={}; const sql=sqlDb();
   try {
     await ensureRunTable(sql);
-    // Prevent duplicate scheduled/manual runs while a run is still in progress.
     const existing=await sql`SELECT status,updated_at FROM pipeline_runs WHERE tanggal=${date} LIMIT 1`;
     if(existing.length && existing[0].status==='running') return NextResponse.json({agent:'daily_pipeline',status:'running',tanggal:date,reason:'Pipeline hari ini masih berjalan.'});
+    await saveRun(sql,{date,status:'running',tasks:[]});
     steps.scheduler=await call(origin,'/api/scheduler',{date});
     if(steps.scheduler?.status!=='success' && steps.scheduler?.status!=='no_schedule') throw new Error(`Scheduler: ${steps.scheduler?.reason || 'gagal'}`);
     if(steps.scheduler?.status==='no_schedule'){await saveRun(sql,{date,status:'no_schedule',tasks:[]});return NextResponse.json({agent:'daily_pipeline',status:'no_schedule',tanggal:date,ai_used:false,steps,duration_ms:Date.now()-startedAt});}
