@@ -7,6 +7,7 @@ export const dynamic = 'force-dynamic';
 
 const env = (n) => typeof process.env[n] === 'string' ? process.env[n].trim() : '';
 const DAY_NAMES = ['Minggu','Senin','Selasa','Rabu','Kamis','Jumat','Sabtu'];
+const STALE_LOCK_MINUTES = 10;
 
 function jakartaNow() {
   const parts = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta', year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(new Date());
@@ -44,7 +45,9 @@ async function runDailyPipeline(origin) {
   const secret = env('CRON_SECRET');
   const headers = { 'content-type': 'application/json', 'cache-control': 'no-cache' };
   if (secret) headers.authorization = `Bearer ${secret}`;
-  const response = await fetch(`${origin}/api/cron/daily-pipeline?manual=${Date.now()}`, { method: 'GET', headers, cache: 'no-store' });
+  const response = await fetch(`${origin}/api/cron/daily-pipeline?manual=${Date.now()}`, {
+    method: 'GET', headers, cache: 'no-store'
+  });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data?.reason || `Daily pipeline HTTP ${response.status}`);
   return data;
@@ -101,7 +104,7 @@ export async function POST(request) {
       await ensureRunTable(sql);
       const origin = originFrom(request);
       const existing = await sql`
-        SELECT status, tasks, documents, publisher, reason
+        SELECT status, tasks, documents, publisher, reason, updated_at
         FROM pipeline_runs
         WHERE tanggal = ${tanggal}
         LIMIT 1
@@ -109,8 +112,17 @@ export async function POST(request) {
       const run = existing[0];
 
       if (run?.status === 'running') {
-        await sendMessage(chatId, `⏳ Generate ${tanggal} masih berjalan.\nTidak menjalankan pipeline baru.`);
-        return Response.json({ ok: true, command: '/hari_ini', tanggal, action: 'already_running' });
+        const updatedAt = new Date(run.updated_at).getTime();
+        const ageMinutes = Number.isFinite(updatedAt) ? (Date.now() - updatedAt) / 60000 : Infinity;
+
+        if (ageMinutes < STALE_LOCK_MINUTES) {
+          await sendMessage(chatId, `⏳ Generate ${tanggal} masih berjalan (${Math.max(0, Math.round(ageMinutes * 10) / 10)} menit).\nTidak menjalankan pipeline baru.`);
+          return Response.json({ ok: true, command: '/hari_ini', tanggal, action: 'already_running' });
+        }
+
+        // Lock lama dari proses yang terputus tidak boleh memblokir manual run selamanya.
+        // Daily pipeline juga melakukan recovery terhadap stale lock sebelum mulai.
+        await sendMessage(chatId, `♻️ Lock generate ${tanggal} sudah stale (${Math.round(ageMinutes)} menit).\nMemulihkan dan menjalankan pipeline baru...`);
       }
 
       if (run?.status === 'success') {
@@ -124,13 +136,11 @@ export async function POST(request) {
         return Response.json({ ok: true, command: '/hari_ini', tanggal, action: 'resend_existing' });
       }
 
-      // Jangan membuat status 'running' di sini. Daily pipeline adalah satu-satunya owner lock.
-      // Sebelumnya webhook mengunci row lebih dulu, sehingga /api/cron/daily-pipeline melihat
-      // status 'running' lalu menolak menjalankan pipeline yang justru dipanggil oleh webhook.
       await sendMessage(chatId, `🔄 Generate hari ini dimulai.\n📅 ${tanggal}\nPipeline dijalankan sekarang...`);
       after(async () => {
         try {
           const result = await runDailyPipeline(origin);
+          if (result?.status === 'running') throw new Error(result?.reason || 'Pipeline masih berjalan.');
           if (result?.status !== 'success') throw new Error(result?.reason || 'Pipeline gagal.');
           const summary = result?.summary || {};
           try {
