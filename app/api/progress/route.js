@@ -57,7 +57,12 @@ export async function POST(request) {
     const results = [];
     for (const task of tasks) {
       if (task.status === 'progress_ready' && task.pertemuan_berikutnya !== null) {
-        results.push(payload(task, null, Number(task.pertemuan_berikutnya), task.progress_status || 'existing', { status_progress: 'reused', idempotent: true }));
+        const currentMeeting = Number(task.pertemuan_berikutnya || 0);
+        const normalizedMeeting = Math.max(BASELINE_SUBBAB, currentMeeting);
+        if (normalizedMeeting !== currentMeeting) {
+          await sql`UPDATE tasks SET pertemuan_berikutnya=${normalizedMeeting}, progress_status='existing', status='progress_ready', updated_at=NOW() WHERE task_id=${task.task_id}`;
+        }
+        results.push(payload(task, null, normalizedMeeting, task.progress_status || 'existing', { status_progress: 'reused', idempotent: true, baseline_applied: normalizedMeeting !== currentMeeting }));
         continue;
       }
 
