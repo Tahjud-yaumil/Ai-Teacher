@@ -1,10 +1,209 @@
 import { NextResponse } from 'next/server';
 import { neon } from '@neondatabase/serverless';
-export const runtime='nodejs'; export const maxDuration=300; export const dynamic='force-dynamic';
-const env=n=>typeof process.env[n]==='string'?process.env[n].trim():''; const sqlDb=()=>{const u=env('DATABASE_URL');if(!u)throw new Error('DATABASE_URL belum tersedia.');return neon(u)};
-const jakartaDate=()=>new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Jakarta'}).format(new Date());
-const authorized=r=>{const s=env('CRON_SECRET');return !s||r.headers.get('authorization')===`Bearer ${s}`};
-async function ensureRunTable(sql){await sql`CREATE TABLE IF NOT EXISTS pipeline_runs (tanggal DATE PRIMARY KEY,status TEXT NOT NULL,tasks JSONB,documents JSONB,publisher JSONB,reason TEXT,updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())`}
-async function saveRun(sql,{date,status,tasks=[],documents=[],publisher=null,reason=null}){await ensureRunTable(sql);await sql`INSERT INTO pipeline_runs (tanggal,status,tasks,documents,publisher,reason,updated_at) VALUES (${date},${status},${JSON.stringify(tasks)}::jsonb,${publisher?JSON.stringify(publisher):null}::jsonb,${reason},NOW()) ON CONFLICT (tanggal) DO UPDATE SET status=EXCLUDED.status,tasks=EXCLUDED.tasks,documents=EXCLUDED.documents,publisher=EXCLUDED.publisher,reason=EXCLUDED.reason,updated_at=NOW()`}
-async function call(origin,path,body){const s=env('CRON_SECRET');const h={'content-type':'application/json','cache-control':'no-cache'};if(s)h.authorization=`Bearer ${s}`;const r=await fetch(`${origin}${path}?cron=${Date.now()}`,{method:'POST',headers:h,body:JSON.stringify(body),cache:'no-store'});const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(`${path} HTTP ${r.status}: ${d?.reason||'request gagal'}`);return d}
-export async function GET(request){if(!authorized(request))return new NextResponse('Unauthorized',{status:401});const date=jakartaDate(),origin=new URL(request.url).origin,startedAt=Date.now(),steps={},sql=sqlDb();try{await ensureRunTable(sql);const e=await sql`SELECT status FROM pipeline_runs WHERE tanggal=${date} LIMIT 1`;if(e.length&&e[0].status==='running')return NextResponse.json({agent:'daily_pipeline',status:'running',tanggal:date,reason:'Pipeline hari ini masih berjalan. Tidak membuat proses baru.'});await saveRun(sql,{date,status:'running'});steps.scheduler=await call(origin,'/api/scheduler',{date});if(steps.scheduler?.status!=='success'&&steps.scheduler?.status!=='no_schedule')throw new Error(`Scheduler: ${steps.scheduler?.reason||'gagal'}`);if(steps.scheduler?.status==='no_schedule'){await saveRun(sql,{date,status:'no_schedule',tasks:[]});return NextResponse.json({agent:'daily_pipeline',status:'no_schedule',tanggal:date,steps,duration_ms:Date.now()-startedAt})}await saveRun(sql,{date,status:'running',tasks:steps.scheduler.tasks||[]});steps.progress=await call(origin,'/api/progress',{tanggal:date});if(steps.progress?.status!=='success'&&steps.progress?.status!=='no_tasks')throw new Error(`Progress Manager: ${steps.progress?.reason||'gagal'}`);steps.content_generator=await call(origin,'/api/content-generator-v4',{tanggal:date,subab:'subab3'});if(steps.content_generator?.status!=='success')throw new Error(`Content Generator: ${steps.content_generator?.reason||'gagal'}`);const documents=(steps.content_generator.documents||[]).filter(d=>d?.status==='success');steps.publisher=documents.length?await call(origin,'/api/publisher',{tanggal:date,documents,tasks:steps.scheduler.tasks||[]}):{agent:'publisher',status:'skipped',reason:'Tidak ada dokumen sukses untuk diterbitkan.'};const finalStatus=steps.publisher?.status==='success'?'success':'error';await saveRun(sql,{date,status:finalStatus,tasks:steps.scheduler.tasks||[],documents,publisher:steps.publisher,reason:finalStatus==='success'?null:(steps.publisher?.reason||'Publisher gagal.')});return NextResponse.json({agent:'daily_pipeline',status:finalStatus,tanggal:date,timezone:'Asia/Jakarta',ai_used:true,quality_review:'skipped',steps,summary:{tasks:(steps.scheduler.tasks||[]).length,documents_generated:documents.length,documents_sent:steps.publisher?.documents_sent||0},duration_ms:Date.now()-startedAt})}catch(error){const reason=error instanceof Error?error.message:'Daily pipeline gagal.';console.error('Daily pipeline error:',error);try{await saveRun(sql,{date,status:'error',tasks:steps.scheduler?.tasks||[],documents:steps.content_generator?.documents||[],publisher:steps.publisher||null,reason})}catch(persistError){console.error('Pipeline run persistence error:',persistError)}return NextResponse.json({agent:'daily_pipeline',status:'error',tanggal:date,timezone:'Asia/Jakarta',steps,reason,duration_ms:Date.now()-startedAt},{status:500})}}
+
+export const runtime = 'nodejs';
+export const maxDuration = 300;
+export const dynamic = 'force-dynamic';
+
+const env = (n) => typeof process.env[n] === 'string' ? process.env[n].trim() : '';
+const sqlDb = () => {
+  const u = env('DATABASE_URL');
+  if (!u) throw new Error('DATABASE_URL belum tersedia.');
+  return neon(u);
+};
+const jakartaDate = () => new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+const authorized = (r) => {
+  const s = env('CRON_SECRET');
+  return !s || r.headers.get('authorization') === `Bearer ${s}`;
+};
+
+// Vercel function ini maksimal 300 detik. Jika row masih "running" lebih lama dari
+// 10 menit, itu bukan proses aktif yang valid lagi, melainkan stale lock dari run
+// yang terputus. Lock seperti ini harus bisa dipulihkan agar pipeline tidak macet
+// permanen untuk tanggal tersebut.
+const STALE_LOCK_MINUTES = 10;
+
+async function ensureRunTable(sql) {
+  await sql`CREATE TABLE IF NOT EXISTS pipeline_runs (
+    tanggal DATE PRIMARY KEY,
+    status TEXT NOT NULL,
+    tasks JSONB,
+    documents JSONB,
+    publisher JSONB,
+    reason TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`;
+}
+
+async function saveRun(sql, { date, status, tasks = [], documents = [], publisher = null, reason = null }) {
+  await ensureRunTable(sql);
+  await sql`INSERT INTO pipeline_runs
+    (tanggal,status,tasks,documents,publisher,reason,updated_at)
+    VALUES (${date},${status},${JSON.stringify(tasks)}::jsonb,${documents.length ? JSON.stringify(documents) : '[]'}::jsonb,${publisher ? JSON.stringify(publisher) : null}::jsonb,${reason},NOW())
+    ON CONFLICT (tanggal) DO UPDATE SET
+      status=EXCLUDED.status,
+      tasks=EXCLUDED.tasks,
+      documents=EXCLUDED.documents,
+      publisher=EXCLUDED.publisher,
+      reason=EXCLUDED.reason,
+      updated_at=NOW()`;
+}
+
+async function call(origin, path, body) {
+  const s = env('CRON_SECRET');
+  const h = { 'content-type': 'application/json', 'cache-control': 'no-cache' };
+  if (s) h.authorization = `Bearer ${s}`;
+  const r = await fetch(`${origin}${path}?cron=${Date.now()}`, {
+    method: 'POST',
+    headers: h,
+    body: JSON.stringify(body),
+    cache: 'no-store'
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(`${path} HTTP ${r.status}: ${d?.reason || 'request gagal'}`);
+  return d;
+}
+
+export async function GET(request) {
+  if (!authorized(request)) return new NextResponse('Unauthorized', { status: 401 });
+
+  const date = jakartaDate();
+  const origin = new URL(request.url).origin;
+  const startedAt = Date.now();
+  const steps = {};
+  const sql = sqlDb();
+
+  try {
+    await ensureRunTable(sql);
+
+    const existing = await sql`
+      SELECT status, updated_at
+      FROM pipeline_runs
+      WHERE tanggal=${date}
+      LIMIT 1
+    `;
+
+    if (existing.length && existing[0].status === 'running') {
+      const updatedAt = new Date(existing[0].updated_at).getTime();
+      const ageMinutes = Number.isFinite(updatedAt) ? (Date.now() - updatedAt) / 60000 : Infinity;
+
+      if (ageMinutes < STALE_LOCK_MINUTES) {
+        return NextResponse.json({
+          agent: 'daily_pipeline',
+          status: 'running',
+          tanggal: date,
+          reason: 'Pipeline hari ini masih berjalan. Tidak membuat proses baru.',
+          lock_age_minutes: Math.max(0, Math.round(ageMinutes * 10) / 10)
+        });
+      }
+
+      console.warn(`Recovering stale pipeline lock for ${date}; age=${ageMinutes.toFixed(1)} minutes.`);
+      await saveRun(sql, {
+        date,
+        status: 'error',
+        reason: `Stale lock dipulihkan otomatis setelah ${Math.round(ageMinutes)} menit.`
+      });
+    }
+
+    await saveRun(sql, { date, status: 'running' });
+
+    steps.scheduler = await call(origin, '/api/scheduler', { date });
+    if (steps.scheduler?.status !== 'success' && steps.scheduler?.status !== 'no_schedule') {
+      throw new Error(`Scheduler: ${steps.scheduler?.reason || 'gagal'}`);
+    }
+
+    if (steps.scheduler?.status === 'no_schedule') {
+      await saveRun(sql, { date, status: 'no_schedule', tasks: [] });
+      return NextResponse.json({
+        agent: 'daily_pipeline',
+        status: 'no_schedule',
+        tanggal: date,
+        steps,
+        duration_ms: Date.now() - startedAt
+      });
+    }
+
+    await saveRun(sql, {
+      date,
+      status: 'running',
+      tasks: steps.scheduler.tasks || []
+    });
+
+    steps.progress = await call(origin, '/api/progress', { tanggal: date });
+    if (steps.progress?.status !== 'success' && steps.progress?.status !== 'no_tasks') {
+      throw new Error(`Progress Manager: ${steps.progress?.reason || 'gagal'}`);
+    }
+
+    steps.content_generator = await call(origin, '/api/content-generator-v4', {
+      tanggal: date,
+      subab: 'subab3'
+    });
+    if (steps.content_generator?.status !== 'success') {
+      throw new Error(`Content Generator: ${steps.content_generator?.reason || 'gagal'}`);
+    }
+
+    const documents = (steps.content_generator.documents || []).filter(d => d?.status === 'success');
+    steps.publisher = documents.length
+      ? await call(origin, '/api/publisher', {
+          tanggal: date,
+          documents,
+          tasks: steps.scheduler.tasks || []
+        })
+      : {
+          agent: 'publisher',
+          status: 'skipped',
+          reason: 'Tidak ada dokumen sukses untuk diterbitkan.'
+        };
+
+    const finalStatus = steps.publisher?.status === 'success' ? 'success' : 'error';
+    await saveRun(sql, {
+      date,
+      status: finalStatus,
+      tasks: steps.scheduler.tasks || [],
+      documents,
+      publisher: steps.publisher,
+      reason: finalStatus === 'success' ? null : (steps.publisher?.reason || 'Publisher gagal.')
+    });
+
+    return NextResponse.json({
+      agent: 'daily_pipeline',
+      status: finalStatus,
+      tanggal: date,
+      timezone: 'Asia/Jakarta',
+      ai_used: true,
+      quality_review: 'skipped',
+      steps,
+      summary: {
+        tasks: (steps.scheduler.tasks || []).length,
+        documents_generated: documents.length,
+        documents_sent: steps.publisher?.documents_sent || 0
+      },
+      duration_ms: Date.now() - startedAt
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : 'Daily pipeline gagal.';
+    console.error('Daily pipeline error:', error);
+    try {
+      await saveRun(sql, {
+        date,
+        status: 'error',
+        tasks: steps.scheduler?.tasks || [],
+        documents: steps.content_generator?.documents || [],
+        publisher: steps.publisher || null,
+        reason
+      });
+    } catch (persistError) {
+      console.error('Pipeline run persistence error:', persistError);
+    }
+
+    return NextResponse.json({
+      agent: 'daily_pipeline',
+      status: 'error',
+      tanggal: date,
+      timezone: 'Asia/Jakarta',
+      steps,
+      reason,
+      duration_ms: Date.now() - startedAt
+    }, { status: 500 });
+  }
+}
