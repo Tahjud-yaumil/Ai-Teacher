@@ -40,7 +40,7 @@ function originFrom(request) {
   return host ? `${proto}://${host}` : `https://${env('VERCEL_URL')}`;
 }
 
-async function runDailyPipeline(origin, tanggal) {
+async function runDailyPipeline(origin) {
   const secret = env('CRON_SECRET');
   const headers = { 'content-type': 'application/json', 'cache-control': 'no-cache' };
   if (secret) headers.authorization = `Bearer ${secret}`;
@@ -124,27 +124,18 @@ export async function POST(request) {
         return Response.json({ ok: true, command: '/hari_ini', tanggal, action: 'resend_existing' });
       }
 
-      // Atomically claim the date for this run. A concurrent request that wins the insert/update will own the run.
-      const claimed = await sql`
-        INSERT INTO pipeline_runs (tanggal, status, tasks, documents, publisher, reason, updated_at)
-        VALUES (${tanggal}, 'running', '[]'::jsonb, '[]'::jsonb, NULL, NULL, NOW())
-        ON CONFLICT (tanggal) DO UPDATE SET
-          status = CASE WHEN pipeline_runs.status = 'running' THEN 'running' ELSE 'running' END,
-          reason = NULL,
-          updated_at = NOW()
-        RETURNING status
-      `;
-
-      if (claimed[0]?.status !== 'running') {
-        await sendMessage(chatId, `⏳ Generate ${tanggal} sedang diproses.`);
-        return Response.json({ ok: true, command: '/hari_ini', tanggal, action: 'already_running' });
-      }
-
+      // Jangan membuat status 'running' di sini. Daily pipeline adalah satu-satunya owner lock.
+      // Sebelumnya webhook mengunci row lebih dulu, sehingga /api/cron/daily-pipeline melihat
+      // status 'running' lalu menolak menjalankan pipeline yang justru dipanggil oleh webhook.
       await sendMessage(chatId, `🔄 Generate hari ini dimulai.\n📅 ${tanggal}\nPipeline dijalankan sekarang...`);
       after(async () => {
         try {
-          const result = await runDailyPipeline(origin, tanggal);
+          const result = await runDailyPipeline(origin);
           if (result?.status !== 'success') throw new Error(result?.reason || 'Pipeline gagal.');
+          const summary = result?.summary || {};
+          try {
+            await sendMessage(chatId, `✅ Generate ${tanggal} selesai.\n📚 Task: ${summary.tasks ?? 0}\n📄 Dokumen: ${summary.documents_generated ?? 0}\n📤 Terkirim: ${summary.documents_sent ?? 0}`);
+          } catch {}
         } catch (error) {
           console.error('Manual pipeline error:', error);
           try { await sendMessage(chatId, `❌ Generate hari ini ${tanggal} gagal:\n${error instanceof Error ? error.message : 'error'}`); } catch {}
