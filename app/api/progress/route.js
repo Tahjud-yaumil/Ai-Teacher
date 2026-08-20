@@ -3,6 +3,7 @@ import { neon } from '@neondatabase/serverless';
 export const runtime = 'nodejs';
 
 const BASELINE_SUBBAB = 3;
+const BASELINE_MEETING = BASELINE_SUBBAB - 1;
 
 function getSql() {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL belum tersedia.');
@@ -20,7 +21,7 @@ function payload(task, row, meeting, progressStatus, extra = {}) {
     mapel: task.mapel,
     kelas: task.kelas,
     pertemuan_berikutnya: meeting,
-    target_subbab: `Subab ${meeting}`,
+    target_subbab: `Subab ${BASELINE_SUBBAB}`,
     progress_status: progressStatus,
     bab_sebelumnya: row?.bab_terakhir || '',
     subbab_sebelumnya: row?.subbab_terakhir || '',
@@ -68,7 +69,30 @@ export async function POST(request) {
 
       const kelas = task.kelas || '-';
       const previous = await sql`SELECT * FROM progress WHERE sekolah=${task.sekolah} AND mapel=${task.mapel} AND kelas=${task.jenis_kegiatan === 'Ekstrakurikuler' ? '-' : kelas} LIMIT 1`;
-      const row = previous[0] || null;
+      let row = previous[0] || null;
+
+      // Pengajaran sudah berjalan sebelum pipeline ini dipasang. Untuk akun/progres
+      // yang masih menyimpan pertemuan 0/1, persist baseline agar Content Generator
+      // yang membaca tabel progress juga mendapatkan pertemuan berikutnya yang benar.
+      if (row) {
+        const lastMeeting = Number(row.pertemuan_terakhir || 0);
+        if (lastMeeting < BASELINE_MEETING) {
+          await sql`
+            UPDATE progress
+            SET pertemuan_terakhir=${BASELINE_MEETING},
+                subbab_terakhir=CASE
+                  WHEN COALESCE(subbab_terakhir, '') = '' THEN ${`Subab ${BASELINE_MEETING}`}
+                  ELSE subbab_terakhir
+                END,
+                updated_at=NOW()
+            WHERE sekolah=${task.sekolah}
+              AND mapel=${task.mapel}
+              AND kelas=${task.jenis_kegiatan === 'Ekstrakurikuler' ? '-' : kelas}
+          `;
+          row = { ...row, pertemuan_terakhir: BASELINE_MEETING, subbab_terakhir: row.subbab_terakhir || `Subab ${BASELINE_MEETING}` };
+        }
+      }
+
       const nextMeeting = nextTeachingMeeting(row);
       const progressStatus = row ? 'existing' : 'new';
 
